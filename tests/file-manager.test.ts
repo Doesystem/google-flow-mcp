@@ -29,6 +29,14 @@ describe("slugify", () => {
     const long = "a".repeat(100);
     expect(slugify(long).length).toBeLessThanOrEqual(50);
   });
+
+  test("returns untitled for empty input", () => {
+    expect(slugify("")).toBe("untitled");
+  });
+
+  test("returns untitled for special-chars-only input", () => {
+    expect(slugify("!!!")).toBe("untitled");
+  });
 });
 
 describe("buildArchivePath", () => {
@@ -44,6 +52,12 @@ describe("buildArchivePath", () => {
   test("falls back to General when no project name", () => {
     const result = buildArchivePath(null, "hero-banner", 1);
     expect(result).toContain(path.join("Google Flow", "General"));
+  });
+
+  test("accepts injectable date for deterministic testing", () => {
+    const date = new Date("2026-01-15T00:00:00Z");
+    const result = buildArchivePath("My Website", "hero-banner", 1, date);
+    expect(result).toContain("2026-01-15");
   });
 });
 
