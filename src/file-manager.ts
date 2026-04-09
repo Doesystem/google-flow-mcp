@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import fs from "fs";
 import { mkdir, writeFile, rm } from "fs/promises";
 import path from "path";
@@ -22,7 +23,8 @@ export function slugify(text: string): string {
 }
 
 export function buildTempPath(slug: string, variationIndex: number): string {
-  return path.join(TEMP_DIR, `${slug}-${variationIndex}.png`);
+  const hash = crypto.randomBytes(4).toString("hex");
+  return path.join(TEMP_DIR, `${slug}-${hash}-${variationIndex}.png`);
 }
 
 export function buildArchivePath(
@@ -41,7 +43,7 @@ export function buildProjectPath(
   variationIndex?: number
 ): string {
   const suffix = variationIndex !== undefined ? `-${variationIndex}` : "";
-  return path.join(projectDir, `${smartName}${suffix}.png`);
+  return path.join(projectDir, "generated-images", `${smartName}${suffix}.png`);
 }
 
 export function nextAvailableName(

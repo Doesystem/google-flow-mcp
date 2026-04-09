@@ -58,8 +58,6 @@ server.tool(
   },
   async ({ prompt, aspect_ratio, count }) => {
     try {
-      await cleanTemp();
-
       const driver = await getDriver();
 
       const images = await driver.generate({
@@ -124,6 +122,8 @@ server.tool(
       const projectName = getProjectName();
       const savedPaths: { archive: string; project: string }[] = [];
 
+      const projectImagesDir = path.join(project_dir, "generated-images");
+
       for (let i = 0; i < temp_paths.length; i++) {
         const buffer = await readFile(temp_paths[i]);
         const variationIndex = temp_paths.length > 1 ? i + 1 : undefined;
@@ -135,10 +135,10 @@ server.tool(
 
         const { name: projectFileName } = variationIndex !== undefined
           ? { name: `${smart_name}-${variationIndex}` }
-          : nextAvailableName(project_dir, smart_name);
+          : nextAvailableName(projectImagesDir, smart_name);
 
         const archivePath = path.join(archiveDir, `${archiveName}.png`);
-        const projectPath = path.join(project_dir, `${projectFileName}.png`);
+        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
 
         await saveImage(Buffer.from(buffer), archivePath);
         await saveImage(Buffer.from(buffer), projectPath);
@@ -185,8 +185,6 @@ server.tool(
   },
   async ({ image_path, prompt, aspect_ratio }) => {
     try {
-      await cleanTemp();
-
       const driver = await getDriver();
 
       const images = await driver.edit({
