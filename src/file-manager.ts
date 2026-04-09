@@ -1,10 +1,10 @@
 import fs from "fs";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, rm } from "fs/promises";
 import path from "path";
 import os from "os";
 
 const ARCHIVE_BASE = path.join(os.homedir(), "Downloads", "Google Flow");
-const DEFAULT_PROJECT_SUBDIR = path.join("assets", "images");
+const TEMP_DIR = path.join(os.tmpdir(), "google-flow");
 const MAX_SLUG_LENGTH = 50;
 
 export function getArchiveBaseDir(): string {
@@ -21,25 +21,42 @@ export function slugify(text: string): string {
   return result || "untitled";
 }
 
+export function buildTempPath(slug: string, variationIndex: number): string {
+  return path.join(TEMP_DIR, `${slug}-${variationIndex}.png`);
+}
+
 export function buildArchivePath(
   projectName: string | null,
-  slug: string,
-  variationIndex: number,
-  date?: Date
+  smartName: string,
+  variationIndex?: number
 ): string {
   const folder = projectName ?? "General";
-  const today = (date ?? new Date()).toISOString().split("T")[0];
-  return path.join(ARCHIVE_BASE, folder, today, `${slug}-${variationIndex}.png`);
+  const suffix = variationIndex !== undefined ? `-${variationIndex}` : "";
+  return path.join(ARCHIVE_BASE, folder, `${smartName}${suffix}.png`);
 }
 
 export function buildProjectPath(
   projectDir: string,
-  slug: string,
-  variationIndex: number,
-  customSubpath?: string
+  smartName: string,
+  variationIndex?: number
 ): string {
-  const subdir = customSubpath ?? DEFAULT_PROJECT_SUBDIR;
-  return path.join(projectDir, subdir, `${slug}-${variationIndex}.png`);
+  const suffix = variationIndex !== undefined ? `-${variationIndex}` : "";
+  return path.join(projectDir, `${smartName}${suffix}.png`);
+}
+
+export function nextAvailableName(
+  dir: string,
+  baseName: string
+): { name: string; index: number | undefined } {
+  const target = path.join(dir, `${baseName}.png`);
+  if (!fs.existsSync(target)) {
+    return { name: baseName, index: undefined };
+  }
+  let i = 2;
+  while (fs.existsSync(path.join(dir, `${baseName}-${i}.png`))) {
+    i++;
+  }
+  return { name: `${baseName}-${i}`, index: i };
 }
 
 export async function saveImage(
@@ -49,4 +66,12 @@ export async function saveImage(
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
   await writeFile(filePath, buffer);
+}
+
+export async function cleanTemp(): Promise<void> {
+  try {
+    await rm(TEMP_DIR, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
 }

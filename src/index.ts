@@ -1,13 +1,20 @@
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import path from "path";
+import { readFile } from "fs/promises";
 import { AuthManager } from "./auth-manager.js";
 import { FlowDriver } from "./flow-driver.js";
 import {
   slugify,
+  buildTempPath,
   buildArchivePath,
+  buildProjectPath,
+  nextAvailableName,
   saveImage,
+  cleanTemp,
+  getArchiveBaseDir,
 } from "./file-manager.js";
 
 const server = new McpServer({
@@ -24,29 +31,23 @@ function getProjectName(): string | null {
 
 server.tool(
   "generate_image",
-  "Generate images using Google Flow. Returns 4 variations saved to an archive folder. Ask the user which ones to keep in the project.",
+  "Generate images using Google Flow. Returns variations saved to a temp folder for preview. Use save_selected_images to keep the ones the user picks.",
   {
     prompt: z.string().describe("Description of the image to generate"),
     aspect_ratio: z
       .string()
       .optional()
       .describe("Aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
-    resolution: z
-      .string()
-      .optional()
-      .describe("Resolution like 1024x1024 or 1920x1080 (if supported by Flow)"),
-    project_path: z
-      .string()
-      .optional()
-      .describe("Custom subdirectory in the project for saving selected images (default: assets/images)"),
     count: z
       .number()
       .optional()
-      .default(4)
-      .describe("Number of variations to generate (default: 4)"),
+      .default(2)
+      .describe("Number of variations to generate (1-4, default: 2)"),
   },
-  async ({ prompt, aspect_ratio, resolution, project_path, count }) => {
+  async ({ prompt, aspect_ratio, count }) => {
     try {
+      await cleanTemp();
+
       const context = await authManager.getAuthenticatedContext();
       const driver = new FlowDriver(context);
       await driver.init();
@@ -54,20 +55,18 @@ server.tool(
       const images = await driver.generate({
         prompt,
         aspectRatio: aspect_ratio,
-        resolution,
         count,
       });
 
       await driver.close();
 
       const slug = slugify(prompt);
-      const projectName = getProjectName();
-      const savedPaths: string[] = [];
+      const tempPaths: string[] = [];
 
       for (const image of images) {
-        const archivePath = buildArchivePath(projectName, slug, image.index);
-        await saveImage(image.buffer, archivePath);
-        savedPaths.push(archivePath);
+        const tempPath = buildTempPath(slug, image.index);
+        await saveImage(image.buffer, tempPath);
+        tempPaths.push(tempPath);
       }
 
       await authManager.close();
@@ -79,11 +78,11 @@ server.tool(
             text: [
               `Generated ${images.length} variation(s) for: "${prompt}"`,
               "",
-              "Saved to archive:",
-              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
+              "Temp preview paths:",
+              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
               "",
-              "Which image(s) would you like to keep in the project?",
-              `(They will be saved to ${project_path ?? "assets/images/"})`,
+              "Use the Read tool on each path to show inline previews.",
+              "Then ask the user which to keep and call save_selected_images.",
             ].join("\n"),
           },
         ],
@@ -100,44 +99,58 @@ server.tool(
 
 server.tool(
   "save_selected_images",
-  "Save user-selected images from the archive to the project directory.",
+  "Save user-selected images to the project directory and archive. Only saves the images the user chose to keep.",
   {
-    archive_paths: z
+    temp_paths: z
       .array(z.string())
-      .describe("Array of archive file paths to copy to the project"),
+      .describe("Array of temp file paths for the selected images"),
+    smart_name: z
+      .string()
+      .describe("Short 2-3 word descriptive name for the files (e.g. 'watercolor-cat', 'neon-city')"),
     project_dir: z
       .string()
       .describe("The project's root directory"),
-    project_path: z
-      .string()
-      .optional()
-      .describe("Custom subdirectory in the project (default: assets/images)"),
   },
-  async ({ archive_paths, project_dir, project_path }) => {
+  async ({ temp_paths, smart_name, project_dir }) => {
     try {
-      const { readFile } = await import("fs/promises");
-      const savedPaths: string[] = [];
+      const projectName = getProjectName();
+      const savedPaths: { archive: string; project: string }[] = [];
 
-      for (const archivePath of archive_paths) {
-        const filename = path.basename(archivePath);
-        const destPath = path.join(
-          project_dir,
-          project_path ?? path.join("assets", "images"),
-          filename
-        );
+      for (let i = 0; i < temp_paths.length; i++) {
+        const buffer = await readFile(temp_paths[i]);
+        const variationIndex = temp_paths.length > 1 ? i + 1 : undefined;
 
-        const buffer = await readFile(archivePath);
-        await saveImage(Buffer.from(buffer), destPath);
-        savedPaths.push(destPath);
+        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+        const { name: archiveName } = variationIndex !== undefined
+          ? { name: `${smart_name}-${variationIndex}` }
+          : nextAvailableName(archiveDir, smart_name);
+
+        const projectDir2 = project_dir;
+        const { name: projectFileName } = variationIndex !== undefined
+          ? { name: `${smart_name}-${variationIndex}` }
+          : nextAvailableName(projectDir2, smart_name);
+
+        const archivePath = path.join(archiveDir, `${archiveName}.png`);
+        const projectPath = path.join(projectDir2, `${projectFileName}.png`);
+
+        await saveImage(Buffer.from(buffer), archivePath);
+        await saveImage(Buffer.from(buffer), projectPath);
+        savedPaths.push({ archive: archivePath, project: projectPath });
       }
+
+      await cleanTemp();
 
       return {
         content: [
           {
             type: "text" as const,
             text: [
-              "Saved to project:",
-              ...savedPaths.map((p) => `  - ${p}`),
+              "Saved selected images:",
+              "",
+              ...savedPaths.map((p, i) => [
+                `  ${i + 1}. Project: ${p.project}`,
+                `     Archive: ${p.archive}`,
+              ].join("\n")),
             ].join("\n"),
           },
         ],
@@ -154,7 +167,7 @@ server.tool(
 
 server.tool(
   "edit_image",
-  "Edit an existing image using Google Flow's inpainting/editing feature.",
+  "Edit an existing image using Google Flow. Returns variations saved to temp for preview.",
   {
     image_path: z.string().describe("Path to the source image to edit"),
     prompt: z.string().describe("Description of what to change"),
@@ -162,17 +175,11 @@ server.tool(
       .string()
       .optional()
       .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
-    resolution: z
-      .string()
-      .optional()
-      .describe("Change resolution (if supported by Flow)"),
-    project_path: z
-      .string()
-      .optional()
-      .describe("Custom subdirectory in the project for saving the result"),
   },
-  async ({ image_path, prompt, aspect_ratio, resolution, project_path }) => {
+  async ({ image_path, prompt, aspect_ratio }) => {
     try {
+      await cleanTemp();
+
       const context = await authManager.getAuthenticatedContext();
       const driver = new FlowDriver(context);
       await driver.init();
@@ -181,19 +188,17 @@ server.tool(
         imagePath: image_path,
         prompt,
         aspectRatio: aspect_ratio,
-        resolution,
       });
 
       await driver.close();
 
       const slug = slugify(prompt);
-      const projectName = getProjectName();
-      const savedPaths: string[] = [];
+      const tempPaths: string[] = [];
 
       for (const image of images) {
-        const archivePath = buildArchivePath(projectName, slug, image.index);
-        await saveImage(image.buffer, archivePath);
-        savedPaths.push(archivePath);
+        const tempPath = buildTempPath(slug, image.index);
+        await saveImage(image.buffer, tempPath);
+        tempPaths.push(tempPath);
       }
 
       await authManager.close();
@@ -205,11 +210,11 @@ server.tool(
             text: [
               `Edited image with prompt: "${prompt}"`,
               "",
-              "Saved to archive:",
-              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
+              "Temp preview paths:",
+              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
               "",
-              "Which result(s) would you like to keep in the project?",
-              `(They will be saved to ${project_path ?? "assets/images/"})`,
+              "Use the Read tool on each path to show inline previews.",
+              "Then ask the user which to keep and call save_selected_images.",
             ].join("\n"),
           },
         ],
@@ -225,6 +230,13 @@ server.tool(
 );
 
 async function main() {
+  const command = process.argv[2];
+
+  if (command === "auth") {
+    await authManager.launchForAuth();
+    process.exit(0);
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[google-flow-mcp] Server started. Waiting for requests...");
