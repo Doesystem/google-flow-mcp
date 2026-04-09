@@ -24,6 +24,18 @@ const server = new McpServer({
 
 const authManager = new AuthManager();
 
+// Reuse a single browser + driver across calls — no re-launching per request
+let activeDriver: FlowDriver | null = null;
+
+async function getDriver(): Promise<FlowDriver> {
+  if (activeDriver) return activeDriver;
+
+  const context = await authManager.getAuthenticatedContext();
+  activeDriver = new FlowDriver(context);
+  await activeDriver.init();
+  return activeDriver;
+}
+
 function getProjectName(): string | null {
   const cwd = process.cwd();
   return path.basename(cwd) || null;
@@ -48,17 +60,13 @@ server.tool(
     try {
       await cleanTemp();
 
-      const context = await authManager.getAuthenticatedContext();
-      const driver = new FlowDriver(context);
-      await driver.init();
+      const driver = await getDriver();
 
       const images = await driver.generate({
         prompt,
         aspectRatio: aspect_ratio,
         count,
       });
-
-      await driver.close();
 
       const slug = slugify(prompt);
       const tempPaths: string[] = [];
@@ -68,8 +76,6 @@ server.tool(
         await saveImage(image.buffer, tempPath);
         tempPaths.push(tempPath);
       }
-
-      await authManager.close();
 
       return {
         content: [
@@ -88,6 +94,8 @@ server.tool(
         ],
       };
     } catch (error) {
+      // Reset driver on failure so next call gets a fresh one
+      activeDriver = null;
       const message = error instanceof Error ? error.message : String(error);
       return {
         content: [{ type: "text" as const, text: `Error generating image: ${message}` }],
@@ -125,13 +133,12 @@ server.tool(
           ? { name: `${smart_name}-${variationIndex}` }
           : nextAvailableName(archiveDir, smart_name);
 
-        const projectDir2 = project_dir;
         const { name: projectFileName } = variationIndex !== undefined
           ? { name: `${smart_name}-${variationIndex}` }
-          : nextAvailableName(projectDir2, smart_name);
+          : nextAvailableName(project_dir, smart_name);
 
         const archivePath = path.join(archiveDir, `${archiveName}.png`);
-        const projectPath = path.join(projectDir2, `${projectFileName}.png`);
+        const projectPath = path.join(project_dir, `${projectFileName}.png`);
 
         await saveImage(Buffer.from(buffer), archivePath);
         await saveImage(Buffer.from(buffer), projectPath);
@@ -180,17 +187,13 @@ server.tool(
     try {
       await cleanTemp();
 
-      const context = await authManager.getAuthenticatedContext();
-      const driver = new FlowDriver(context);
-      await driver.init();
+      const driver = await getDriver();
 
       const images = await driver.edit({
         imagePath: image_path,
         prompt,
         aspectRatio: aspect_ratio,
       });
-
-      await driver.close();
 
       const slug = slugify(prompt);
       const tempPaths: string[] = [];
@@ -200,8 +203,6 @@ server.tool(
         await saveImage(image.buffer, tempPath);
         tempPaths.push(tempPath);
       }
-
-      await authManager.close();
 
       return {
         content: [
@@ -220,6 +221,7 @@ server.tool(
         ],
       };
     } catch (error) {
+      activeDriver = null;
       const message = error instanceof Error ? error.message : String(error);
       return {
         content: [{ type: "text" as const, text: `Error editing image: ${message}` }],

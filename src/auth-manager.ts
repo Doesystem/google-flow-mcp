@@ -1,14 +1,16 @@
 import fs from "fs";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import path from "path";
 import os from "os";
 import { chromium, BrowserContext } from "playwright";
 
 const FLOW_URL = "https://labs.google/fx/tools/flow";
-const PROFILE_DIR = path.join(os.homedir(), ".google-flow-mcp", "chrome-profile");
-// Flow now lands on a project dashboard when logged in
+const AUTH_DIR = path.join(os.homedir(), ".google-flow-mcp");
+const PROFILE_DIR = path.join(AUTH_DIR, "chrome-profile");
+const STATE_FILE = path.join(AUTH_DIR, "state.json");
+const LOCK_FILE = path.join(PROFILE_DIR, "SingletonLock");
 const LOGGED_IN_SELECTOR = 'button:has-text("New project"), [data-slate-editor="true"]';
 
-// Playwright injects these flags which Google uses to detect automation
 const AUTOMATION_FLAGS = [
   "--enable-automation",
   "--disable-extensions",
@@ -17,34 +19,35 @@ const AUTOMATION_FLAGS = [
   "--no-first-run",
 ];
 
-function launchOptions(headless: boolean) {
-  return {
-    channel: "chrome" as const,
-    headless,
-    ignoreDefaultArgs: AUTOMATION_FLAGS,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-    ],
-  };
+function clearStaleLock(): void {
+  try {
+    if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
+  } catch { /* ignore */ }
 }
 
 export class AuthManager {
+  private browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   private context: BrowserContext | null = null;
 
-  hasProfile(): boolean {
-    return fs.existsSync(PROFILE_DIR);
+  hasSavedState(): boolean {
+    return fs.existsSync(STATE_FILE);
   }
 
   async launchForAuth(): Promise<void> {
     console.error("[google-flow-mcp] Launching Chrome for authentication...");
-    console.error("[google-flow-mcp] Please sign in with your Google AI Pro account.");
+    console.error("[google-flow-mcp] Sign in with your Google AI Pro account.");
 
-    const context = await chromium.launchPersistentContext(
-      PROFILE_DIR,
-      launchOptions(false)
-    );
+    await mkdir(AUTH_DIR, { recursive: true });
+    clearStaleLock();
 
-    // Remove navigator.webdriver flag that Google checks
+    // Use persistent context with real Chrome for auth only
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+      channel: "chrome",
+      headless: false,
+      ignoreDefaultArgs: AUTOMATION_FLAGS,
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+
     await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
@@ -52,32 +55,41 @@ export class AuthManager {
     const page = context.pages()[0] ?? await context.newPage();
     await page.goto(FLOW_URL, { waitUntil: "networkidle" });
 
-    console.error("[google-flow-mcp] Waiting for successful login (5 min timeout)...");
-
+    console.error("[google-flow-mcp] Waiting for login (5 min timeout)...");
     await page.waitForSelector(LOGGED_IN_SELECTOR, { timeout: 300_000 });
 
-    console.error("[google-flow-mcp] Login detected. Session saved to Chrome profile.");
+    // Save session state (cookies + localStorage) to a file
+    const state = await context.storageState();
+    await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
+
+    console.error("[google-flow-mcp] Session saved. Auth complete.");
     await context.close();
-    console.error("[google-flow-mcp] Auth complete. You can now use the MCP server.");
   }
 
   async getAuthenticatedContext(): Promise<BrowserContext> {
-    if (!this.hasProfile()) {
+    if (!this.hasSavedState()) {
       throw new Error(
         "Google Flow session not set up. Run `npx google-flow-mcp auth` to sign in."
       );
     }
 
-    this.context = await chromium.launchPersistentContext(
-      PROFILE_DIR,
-      launchOptions(true)
-    );
+    // Load saved state into a regular (non-persistent) browser — no locks, no conflicts
+    const state = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+
+    this.browser = await chromium.launch({
+      channel: "chrome",
+      headless: true,
+      ignoreDefaultArgs: AUTOMATION_FLAGS,
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+
+    this.context = await this.browser!.newContext({ storageState: state });
 
     await this.context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    const page = this.context.pages()[0] ?? await this.context.newPage();
+    const page = await this.context.newPage();
     await page.goto(FLOW_URL, { waitUntil: "networkidle" });
 
     const isLoggedIn = await page
@@ -86,7 +98,7 @@ export class AuthManager {
       .catch(() => false);
 
     if (!isLoggedIn) {
-      await this.context.close();
+      await this.browser!.close();
       this.context = null;
       throw new Error(
         "Google Flow session expired. Run `npx google-flow-mcp auth` to re-authenticate."
@@ -98,8 +110,8 @@ export class AuthManager {
   }
 
   async close(): Promise<void> {
-    if (this.context) {
-      await this.context.close();
+    if (this.browser) {
+      await this.browser!.close();
       this.context = null;
     }
   }

@@ -36,14 +36,25 @@ export class FlowDriver {
     this.page = await this.context.newPage();
     await this.page.goto(FLOW_URL, { waitUntil: "networkidle" });
 
-    // Flow lands on project dashboard — create a new project to get to the editor
+    // Flow lands on project dashboard — reuse first existing project or create new
     const onDashboard = await this.page
       .waitForSelector(DASHBOARD_SELECTOR, { timeout: 10_000 })
       .then(() => true)
       .catch(() => false);
 
     if (onDashboard) {
-      await this.page.locator(DASHBOARD_SELECTOR).click();
+      // Try to open the first existing project
+      const existingProject = this.page.locator('a[href*="project/"]').first();
+      const hasExisting = await existingProject.isVisible().catch(() => false);
+
+      if (hasExisting) {
+        await existingProject.click();
+        console.error("[google-flow-mcp] Reusing existing Flow project");
+      } else {
+        await this.page.locator(DASHBOARD_SELECTOR).click();
+        console.error("[google-flow-mcp] Created new Flow project");
+      }
+
       await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
     } else {
       // May already be in a project
@@ -67,9 +78,17 @@ export class FlowDriver {
     // Close settings panel by clicking outside
     await this.closeSettingsPanel();
 
+    // Count existing images before generating so we only download new ones
+    const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
+    const existingSrcs = new Set<string>();
+    for (const el of existingImages) {
+      const src = await el.getAttribute("src");
+      if (src) existingSrcs.add(src);
+    }
+
     await this.typePrompt(options.prompt);
     await this.clickCreate();
-    const images = await this.waitAndDownloadImages(count);
+    const images = await this.waitAndDownloadNewImages(count, existingSrcs);
     return images;
   }
 
@@ -84,9 +103,16 @@ export class FlowDriver {
     }
     await this.closeSettingsPanel();
 
+    const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
+    const existingSrcs = new Set<string>();
+    for (const el of existingImages) {
+      const src = await el.getAttribute("src");
+      if (src) existingSrcs.add(src);
+    }
+
     await this.typePrompt(options.prompt);
     await this.clickCreate();
-    const images = await this.waitAndDownloadImages(1);
+    const images = await this.waitAndDownloadNewImages(1, existingSrcs);
     return images;
   }
 
@@ -156,31 +182,32 @@ export class FlowDriver {
     }
   }
 
-  private async waitAndDownloadImages(expectedCount: number): Promise<GeneratedImage[]> {
-    // Wait for the first generated image to appear (can take 20-50s)
-    await this.page!.waitForSelector(GENERATED_IMAGE_SELECTOR, {
-      timeout: 120_000,
-      state: "attached",
-    });
+  private async waitAndDownloadNewImages(
+    expectedCount: number,
+    existingSrcs: Set<string>
+  ): Promise<GeneratedImage[]> {
+    // Poll for new images that weren't on the page before generation
+    const deadline = Date.now() + 120_000;
+    let newSrcs: string[] = [];
 
-    // Wait for all expected images to load — poll until we have enough or timeout
-    const deadline = Date.now() + 60_000;
-    let imageElements = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
-    while (imageElements.length < expectedCount && Date.now() < deadline) {
-      await this.page!.waitForTimeout(3_000);
-      imageElements = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+    while (newSrcs.length < expectedCount && Date.now() < deadline) {
+      await this.page!.waitForTimeout(5_000);
+      const allElements = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+      newSrcs = [];
+      for (const el of allElements) {
+        const src = await el.getAttribute("src");
+        if (src && !existingSrcs.has(src)) {
+          newSrcs.push(src);
+        }
+      }
     }
 
-    console.error(`[google-flow-mcp] Found ${imageElements.length} generated image(s)`);
+    console.error(`[google-flow-mcp] Found ${newSrcs.length} new generated image(s)`);
 
     const images: GeneratedImage[] = [];
-    for (let i = 0; i < Math.min(imageElements.length, expectedCount); i++) {
+    for (let i = 0; i < Math.min(newSrcs.length, expectedCount); i++) {
       try {
-        const src = await imageElements[i].getAttribute("src");
-        if (!src) continue;
-
-        // Ensure absolute URL
-        const url = src.startsWith("http") ? src : `https://labs.google${src}`;
+        const url = newSrcs[i].startsWith("http") ? newSrcs[i] : `https://labs.google${newSrcs[i]}`;
         const response = await this.page!.request.get(url);
         const buffer = Buffer.from(await response.body());
         images.push({ buffer, index: i + 1 });
