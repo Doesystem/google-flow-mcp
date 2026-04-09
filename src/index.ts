@@ -7,7 +7,6 @@ import { FlowDriver } from "./flow-driver.js";
 import {
   slugify,
   buildArchivePath,
-  buildProjectPath,
   saveImage,
 } from "./file-manager.js";
 
@@ -115,33 +114,41 @@ server.tool(
       .describe("Custom subdirectory in the project (default: assets/images)"),
   },
   async ({ archive_paths, project_dir, project_path }) => {
-    const { readFile } = await import("fs/promises");
-    const savedPaths: string[] = [];
+    try {
+      const { readFile } = await import("fs/promises");
+      const savedPaths: string[] = [];
 
-    for (const archivePath of archive_paths) {
-      const filename = path.basename(archivePath);
-      const destPath = path.join(
-        project_dir,
-        project_path ?? path.join("assets", "images"),
-        filename
-      );
+      for (const archivePath of archive_paths) {
+        const filename = path.basename(archivePath);
+        const destPath = path.join(
+          project_dir,
+          project_path ?? path.join("assets", "images"),
+          filename
+        );
 
-      const buffer = await readFile(archivePath);
-      await saveImage(Buffer.from(buffer), destPath);
-      savedPaths.push(destPath);
+        const buffer = await readFile(archivePath);
+        await saveImage(Buffer.from(buffer), destPath);
+        savedPaths.push(destPath);
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              "Saved to project:",
+              ...savedPaths.map((p) => `  - ${p}`),
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error saving images: ${message}` }],
+        isError: true,
+      };
     }
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: [
-            "Saved to project:",
-            ...savedPaths.map((p) => `  - ${p}`),
-          ].join("\n"),
-        },
-      ],
-    };
   }
 );
 
