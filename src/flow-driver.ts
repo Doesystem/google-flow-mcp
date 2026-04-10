@@ -22,7 +22,7 @@ export interface EditOptions {
 
 export interface RegenOptions {
   imageIndex: number;
-  prompt: string;
+  prompt?: string;
   aspectRatio?: string;
 }
 
@@ -190,7 +190,9 @@ export class FlowDriver {
       if (src) existingSrcs.add(src);
     }
 
-    await this.typePrompt(options.prompt);
+    if (options.prompt) {
+      await this.typePrompt(options.prompt);
+    }
     await this.clickCreate();
     const images = await this.waitAndDownloadNewImages(1, existingSrcs);
     return images;
