@@ -43,9 +43,13 @@ function getProjectName(): string | null {
 
 server.tool(
   "generate_image",
-  "Generate images using Google Flow. Returns variations saved to a temp folder for preview. Use save_selected_images to keep the ones the user picks.",
+  "Generate images using Google Flow. Optionally upload reference images to guide generation. Returns variations saved to a temp folder for preview. Use save_selected_images to keep the ones the user picks.",
   {
     prompt: z.string().describe("Description of the image to generate"),
+    image_paths: z
+      .array(z.string())
+      .optional()
+      .describe("Optional array of reference image file paths to guide generation"),
     aspect_ratio: z
       .string()
       .optional()
@@ -56,15 +60,22 @@ server.tool(
       .default(2)
       .describe("Number of variations to generate (1-4, default: 2)"),
   },
-  async ({ prompt, aspect_ratio, count }) => {
+  async ({ prompt, image_paths, aspect_ratio, count }) => {
     try {
       const driver = await getDriver();
 
-      const images = await driver.generate({
+      const jobId = await driver.submitGeneration({
         prompt,
+        imagePaths: image_paths,
         aspectRatio: aspect_ratio,
         count,
       });
+      // Collect images for this job (Task 2 will replace this with collectAllImages)
+      const job = driver.pendingJobs.find((j) => j.id === jobId);
+      const images = job
+        ? await driver.waitAndDownloadNewImages(job.expectedCount, job.beforeSrcs)
+        : [];
+      driver.pendingJobs = driver.pendingJobs.filter((j) => j.id !== jobId);
 
       const slug = slugify(prompt);
       const tempPaths: string[] = [];
@@ -174,21 +185,23 @@ server.tool(
 
 server.tool(
   "edit_image",
-  "Edit an existing image using Google Flow. Returns variations saved to temp for preview.",
+  "Edit one or more images using Google Flow. Upload reference images and describe the changes. Returns variations saved to temp for preview.",
   {
-    image_path: z.string().describe("Path to the source image to edit"),
+    image_paths: z
+      .array(z.string())
+      .describe("Array of file paths to the source image(s) to edit"),
     prompt: z.string().describe("Description of what to change"),
     aspect_ratio: z
       .string()
       .optional()
       .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
   },
-  async ({ image_path, prompt, aspect_ratio }) => {
+  async ({ image_paths, prompt, aspect_ratio }) => {
     try {
       const driver = await getDriver();
 
       const images = await driver.edit({
-        imagePath: image_path,
+        imagePaths: image_paths,
         prompt,
         aspectRatio: aspect_ratio,
       });
@@ -223,6 +236,65 @@ server.tool(
       const message = error instanceof Error ? error.message : String(error);
       return {
         content: [{ type: "text" as const, text: `Error editing image: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "regen_image",
+  "Regenerate from an existing generated image in the current Flow session. Clicks on the image by index to open the edit view, then applies a new prompt. Use this to iterate on a previously generated image without re-uploading.",
+  {
+    image_index: z
+      .number()
+      .describe("1-based index of the generated image to regen from (e.g. 1 for first image)"),
+    prompt: z.string().describe("New prompt describing what to change or regenerate"),
+    aspect_ratio: z
+      .string()
+      .optional()
+      .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
+  },
+  async ({ image_index, prompt, aspect_ratio }) => {
+    try {
+      const driver = await getDriver();
+
+      const images = await driver.regen({
+        imageIndex: image_index,
+        prompt,
+        aspectRatio: aspect_ratio,
+      });
+
+      const slug = slugify(prompt);
+      const tempPaths: string[] = [];
+
+      for (const image of images) {
+        const tempPath = buildTempPath(slug, image.index);
+        await saveImage(image.buffer, tempPath);
+        tempPaths.push(tempPath);
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: [
+              `Regenerated from image #${image_index} with prompt: "${prompt}"`,
+              "",
+              "Temp preview paths:",
+              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
+              "",
+              "Use the Read tool on each path to show inline previews.",
+              "Then ask the user which to keep and call save_selected_images.",
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (error) {
+      activeDriver = null;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error regenerating image: ${message}` }],
         isError: true,
       };
     }

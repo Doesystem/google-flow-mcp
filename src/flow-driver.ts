@@ -7,16 +7,23 @@ const GENERATED_IMAGE_SELECTOR = 'img[src*="media.getMediaUrlRedirect"]';
 
 export interface GenerateOptions {
   prompt: string;
+  imagePaths?: string[];
   aspectRatio?: string;
   resolution?: string;
   count?: number;
 }
 
 export interface EditOptions {
-  imagePath: string;
+  imagePaths: string[];
   prompt: string;
   aspectRatio?: string;
   resolution?: string;
+}
+
+export interface RegenOptions {
+  imageIndex: number;
+  prompt: string;
+  aspectRatio?: string;
 }
 
 export interface GeneratedImage {
@@ -24,9 +31,17 @@ export interface GeneratedImage {
   index: number;
 }
 
+export interface PendingJob {
+  id: string;
+  expectedCount: number;
+  beforeSrcs: Set<string>;
+}
+
 export class FlowDriver {
   private context: BrowserContext;
   private page: Page | null = null;
+  pendingJobs: PendingJob[] = [];
+  private jobCounter = 0;
 
   constructor(context: BrowserContext) {
     this.context = context;
@@ -62,8 +77,13 @@ export class FlowDriver {
     }
   }
 
-  async generate(options: GenerateOptions): Promise<GeneratedImage[]> {
+  async submitGeneration(options: GenerateOptions): Promise<string> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
+
+    // Upload reference images if provided
+    if (options.imagePaths && options.imagePaths.length > 0) {
+      await this.uploadImages(options.imagePaths);
+    }
 
     // Open settings panel to set aspect ratio and count
     await this.openSettingsPanel();
@@ -75,10 +95,54 @@ export class FlowDriver {
     const count = options.count ?? 2;
     await this.setOutputCount(count);
 
-    // Close settings panel by clicking outside
+    // Close settings panel
     await this.closeSettingsPanel();
 
-    // Count existing images before generating so we only download new ones
+    // Snapshot existing image srcs before generating
+    const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
+    const beforeSrcs = new Set<string>();
+    for (const el of existingImages) {
+      const src = await el.getAttribute("src");
+      if (src) beforeSrcs.add(src);
+    }
+
+    await this.typePrompt(options.prompt);
+    await this.clickCreate();
+
+    // Wait for prompt field to reset to placeholder (signals UI is ready for next prompt)
+    await this.waitForPromptReset();
+
+    const jobId = `job-${++this.jobCounter}`;
+    this.pendingJobs.push({ id: jobId, expectedCount: count, beforeSrcs });
+
+    console.error(`[google-flow-mcp] Submitted generation "${options.prompt}" as ${jobId} (expecting ${count} images)`);
+    return jobId;
+  }
+
+  private async waitForPromptReset(): Promise<void> {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const editor = this.page!.locator(PROMPT_SELECTOR);
+      const text = await editor.textContent();
+      if (!text || text.startsWith("What do you want to")) {
+        return;
+      }
+      await this.page!.waitForTimeout(200);
+    }
+    console.error("[google-flow-mcp] Prompt reset timeout — proceeding anyway");
+  }
+
+  async edit(options: EditOptions): Promise<GeneratedImage[]> {
+    if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
+
+    await this.uploadImages(options.imagePaths);
+
+    await this.openSettingsPanel();
+    if (options.aspectRatio) {
+      await this.setAspectRatio(options.aspectRatio);
+    }
+    await this.closeSettingsPanel();
+
     const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
     const existingSrcs = new Set<string>();
     for (const el of existingImages) {
@@ -88,21 +152,37 @@ export class FlowDriver {
 
     await this.typePrompt(options.prompt);
     await this.clickCreate();
-    const images = await this.waitAndDownloadNewImages(count, existingSrcs);
+    const images = await this.waitAndDownloadNewImages(1, existingSrcs);
     return images;
   }
 
-  async edit(options: EditOptions): Promise<GeneratedImage[]> {
+  async regen(options: RegenOptions): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
-    await this.uploadImage(options.imagePath);
+    // Click on the nth generated image to open the edit view
+    const allImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
+    const targetIndex = options.imageIndex - 1; // 1-based to 0-based
 
-    await this.openSettingsPanel();
-    if (options.aspectRatio) {
-      await this.setAspectRatio(options.aspectRatio);
+    if (targetIndex < 0 || targetIndex >= allImages.length) {
+      throw new Error(
+        `Image index ${options.imageIndex} out of range. There are ${allImages.length} generated image(s).`
+      );
     }
-    await this.closeSettingsPanel();
 
+    await allImages[targetIndex].click();
+    console.error(`[google-flow-mcp] Clicked generated image #${options.imageIndex} to open edit view`);
+
+    // Wait for the edit view prompt to appear
+    await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 10_000 });
+    await this.page.waitForTimeout(1_000);
+
+    if (options.aspectRatio) {
+      await this.openSettingsPanel();
+      await this.setAspectRatio(options.aspectRatio);
+      await this.closeSettingsPanel();
+    }
+
+    // Snapshot existing images before creating
     const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
     const existingSrcs = new Set<string>();
     for (const el of existingImages) {
@@ -182,7 +262,7 @@ export class FlowDriver {
     }
   }
 
-  private async waitAndDownloadNewImages(
+  async waitAndDownloadNewImages(
     expectedCount: number,
     existingSrcs: Set<string>
   ): Promise<GeneratedImage[]> {
@@ -219,7 +299,7 @@ export class FlowDriver {
     return images;
   }
 
-  private async uploadImage(imagePath: string): Promise<void> {
+  private async uploadImages(imagePaths: string[]): Promise<void> {
     // Click the "+" / "Add Media" button to get file input
     const addBtn = this.page!.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
     try {
@@ -230,9 +310,10 @@ export class FlowDriver {
 
     const fileInput = this.page!.locator('input[type="file"]').first();
     try {
-      await fileInput.setInputFiles(imagePath);
+      // Playwright setInputFiles accepts an array for multi-file upload
+      await fileInput.setInputFiles(imagePaths);
     } catch {
-      console.error("[google-flow-mcp] Could not upload image");
+      console.error("[google-flow-mcp] Could not upload images");
     }
   }
 
