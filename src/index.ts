@@ -252,8 +252,11 @@ server.tool(
       .string()
       .optional()
       .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
+    project_dir: z
+      .string()
+      .describe("The project's root directory where generated-images/ will be created"),
   },
-  async ({ image_paths, prompt, aspect_ratio }) => {
+  async ({ image_paths, prompt, aspect_ratio, project_dir }) => {
     try {
       const driver = await getDriver();
 
@@ -263,13 +266,22 @@ server.tool(
         aspectRatio: aspect_ratio,
       });
 
-      const slug = slugify(prompt);
-      const tempPaths: string[] = [];
+      const smartName = slugify(prompt);
+      const projectName = getProjectName();
+      const projectImagesDir = path.join(project_dir, "generated-images");
+      const savedPaths: string[] = [];
 
       for (const image of images) {
-        const tempPath = buildTempPath(slug, image.index);
-        await saveImage(image.buffer, tempPath);
-        tempPaths.push(tempPath);
+        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
+
+        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+        const archivePath = path.join(archiveDir, `${archiveName}.png`);
+
+        await saveImage(image.buffer, projectPath);
+        await saveImage(image.buffer, archivePath);
+        savedPaths.push(projectPath);
       }
 
       return {
@@ -279,11 +291,10 @@ server.tool(
             text: [
               `Edited image with prompt: "${prompt}"`,
               "",
-              "Temp preview paths:",
-              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
+              "Saved to:",
+              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
               "",
               "Use the Read tool on each path to show inline previews.",
-              "Then ask the user which to keep and call save_selected_images.",
             ].join("\n"),
           },
         ],
@@ -311,8 +322,11 @@ server.tool(
       .string()
       .optional()
       .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
+    project_dir: z
+      .string()
+      .describe("The project's root directory where generated-images/ will be created"),
   },
-  async ({ image_index, prompt, aspect_ratio }) => {
+  async ({ image_index, prompt, aspect_ratio, project_dir }) => {
     try {
       const driver = await getDriver();
 
@@ -322,13 +336,22 @@ server.tool(
         aspectRatio: aspect_ratio,
       });
 
-      const slug = slugify(prompt ?? `regen-${image_index}`);
-      const tempPaths: string[] = [];
+      const smartName = slugify(prompt ?? `regen-${image_index}`);
+      const projectName = getProjectName();
+      const projectImagesDir = path.join(project_dir, "generated-images");
+      const savedPaths: string[] = [];
 
       for (const image of images) {
-        const tempPath = buildTempPath(slug, image.index);
-        await saveImage(image.buffer, tempPath);
-        tempPaths.push(tempPath);
+        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
+
+        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+        const archivePath = path.join(archiveDir, `${archiveName}.png`);
+
+        await saveImage(image.buffer, projectPath);
+        await saveImage(image.buffer, archivePath);
+        savedPaths.push(projectPath);
       }
 
       return {
@@ -340,11 +363,10 @@ server.tool(
                 ? `Regenerated from image #${image_index} with prompt: "${prompt}"`
                 : `Regenerated a new variation from image #${image_index}`,
               "",
-              "Temp preview paths:",
-              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
+              "Saved to:",
+              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
               "",
               "Use the Read tool on each path to show inline previews.",
-              "Then ask the user which to keep and call save_selected_images.",
             ].join("\n"),
           },
         ],
