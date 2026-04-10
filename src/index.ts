@@ -118,44 +118,32 @@ server.tool(
         };
       }
 
-      const jobs = await driver.collectAllImages();
+      const images = await driver.collectAllImages();
       const projectName = getProjectName();
       const projectImagesDir = path.join(project_dir, "generated-images");
-      const savedFiles: { jobId: string; prompt: string; paths: { project: string; archive: string }[] }[] = [];
+      const savedPaths: string[] = [];
 
-      for (const job of jobs) {
-        const smartName = slugify(job.prompt);
-        const jobPaths: { project: string; archive: string }[] = [];
+      for (const image of images) {
+        const smartName = `generation-${image.index}`;
+        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
 
-        for (const image of job.images) {
-          const variationSuffix = job.images.length > 1 ? `-${image.index}` : "";
-          const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
 
-          const { name: archiveName } = nextAvailableName(archiveDir, `${smartName}${variationSuffix}`);
-          const { name: projectFileName } = nextAvailableName(projectImagesDir, `${smartName}${variationSuffix}`);
+        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+        const archivePath = path.join(archiveDir, `${archiveName}.png`);
 
-          const archivePath = path.join(archiveDir, `${archiveName}.png`);
-          const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-
-          await saveImage(image.buffer, archivePath);
-          await saveImage(image.buffer, projectPath);
-          jobPaths.push({ project: projectPath, archive: archivePath });
-        }
-
-        savedFiles.push({ jobId: job.id, prompt: job.prompt, paths: jobPaths });
+        await saveImage(image.buffer, projectPath);
+        await saveImage(image.buffer, archivePath);
+        savedPaths.push(projectPath);
       }
 
-      const lines: string[] = [`Collected and saved ${jobs.length} generation(s):`, ""];
-
-      for (const { jobId, prompt, paths } of savedFiles) {
-        lines.push(`${jobId} — "${prompt}" (${paths.length} image(s)):`);
-        for (let i = 0; i < paths.length; i++) {
-          lines.push(`  ${i + 1}. ${paths[i].project}`);
-        }
-        lines.push("");
+      const lines: string[] = [`Collected and saved ${images.length} image(s):`, ""];
+      for (let i = 0; i < savedPaths.length; i++) {
+        lines.push(`  ${i + 1}. ${savedPaths[i]}`);
       }
-
-      lines.push("Use the Read tool on each project path to show inline previews.");
+      lines.push("");
+      lines.push("Use the Read tool on each path to preview and identify which is which.");
 
       return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
