@@ -31,8 +31,15 @@ export interface GeneratedImage {
   index: number;
 }
 
+export interface CollectedJob {
+  id: string;
+  prompt: string;
+  images: GeneratedImage[];
+}
+
 export interface PendingJob {
   id: string;
+  prompt: string;
   expectedCount: number;
   beforeSrcs: Set<string>;
 }
@@ -105,7 +112,7 @@ export class FlowDriver {
     await this.waitForPromptReset();
 
     const jobId = `job-${++this.jobCounter}`;
-    this.pendingJobs.push({ id: jobId, expectedCount: count, beforeSrcs });
+    this.pendingJobs.push({ id: jobId, prompt: options.prompt, expectedCount: count, beforeSrcs });
 
     console.error(`[google-flow-mcp] Submitted generation "${options.prompt}" as ${jobId} (expecting ${count} images)`);
     return jobId;
@@ -315,11 +322,11 @@ export class FlowDriver {
     return this.pendingJobs.length > 0;
   }
 
-  async collectAllImages(): Promise<Map<string, GeneratedImage[]>> {
+  async collectAllImages(): Promise<CollectedJob[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
     if (this.pendingJobs.length === 0) {
-      return new Map();
+      return [];
     }
 
     const totalExpected = this.pendingJobs.reduce((sum, job) => sum + job.expectedCount, 0);
@@ -363,7 +370,7 @@ export class FlowDriver {
     }
 
     // Group downloaded images by job (in submission order)
-    const results = new Map<string, GeneratedImage[]>();
+    const results: CollectedJob[] = [];
     let offset = 0;
     for (const job of this.pendingJobs) {
       const jobImages: GeneratedImage[] = [];
@@ -371,7 +378,7 @@ export class FlowDriver {
         const img = allDownloaded[offset + i];
         jobImages.push({ buffer: img.buffer, index: i + 1 });
       }
-      results.set(job.id, jobImages);
+      results.push({ id: job.id, prompt: job.prompt, images: jobImages });
       offset += job.expectedCount;
     }
 

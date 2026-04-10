@@ -97,9 +97,13 @@ server.tool(
 
 server.tool(
   "collect_images",
-  "Wait for all pending image generations to complete and download the results. Call this after submitting one or more generate_image requests. Returns all generated images grouped by job, saved to temp folders for preview.",
-  {},
-  async () => {
+  "Wait for all pending image generations to complete, download and save them to the project's generated-images/ directory and archive. Call this after submitting one or more generate_image requests.",
+  {
+    project_dir: z
+      .string()
+      .describe("The project's root directory where generated-images/ will be created"),
+  },
+  async ({ project_dir }) => {
     try {
       const driver = await getDriver();
 
@@ -114,33 +118,44 @@ server.tool(
         };
       }
 
-      const results = await driver.collectAllImages();
+      const jobs = await driver.collectAllImages();
+      const projectName = getProjectName();
+      const projectImagesDir = path.join(project_dir, "generated-images");
+      const savedFiles: { jobId: string; prompt: string; paths: { project: string; archive: string }[] }[] = [];
 
-      const allTempPaths: { jobId: string; paths: string[] }[] = [];
+      for (const job of jobs) {
+        const smartName = slugify(job.prompt);
+        const jobPaths: { project: string; archive: string }[] = [];
 
-      for (const [jobId, images] of results) {
-        const slug = slugify(jobId);
-        const paths: string[] = [];
-        for (const image of images) {
-          const tempPath = buildTempPath(slug, image.index);
-          await saveImage(image.buffer, tempPath);
-          paths.push(tempPath);
+        for (const image of job.images) {
+          const variationSuffix = job.images.length > 1 ? `-${image.index}` : "";
+          const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+
+          const { name: archiveName } = nextAvailableName(archiveDir, `${smartName}${variationSuffix}`);
+          const { name: projectFileName } = nextAvailableName(projectImagesDir, `${smartName}${variationSuffix}`);
+
+          const archivePath = path.join(archiveDir, `${archiveName}.png`);
+          const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+
+          await saveImage(image.buffer, archivePath);
+          await saveImage(image.buffer, projectPath);
+          jobPaths.push({ project: projectPath, archive: archivePath });
         }
-        allTempPaths.push({ jobId, paths });
+
+        savedFiles.push({ jobId: job.id, prompt: job.prompt, paths: jobPaths });
       }
 
-      const lines: string[] = [`Collected ${results.size} generation(s):`, ""];
+      const lines: string[] = [`Collected and saved ${jobs.length} generation(s):`, ""];
 
-      for (const { jobId, paths } of allTempPaths) {
-        lines.push(`${jobId} (${paths.length} image(s)):`);
+      for (const { jobId, prompt, paths } of savedFiles) {
+        lines.push(`${jobId} — "${prompt}" (${paths.length} image(s)):`);
         for (let i = 0; i < paths.length; i++) {
-          lines.push(`  ${i + 1}. ${paths[i]}`);
+          lines.push(`  ${i + 1}. ${paths[i].project}`);
         }
         lines.push("");
       }
 
-      lines.push("Use the Read tool on each path to show inline previews.");
-      lines.push("Then ask the user which to keep and call save_selected_images.");
+      lines.push("Use the Read tool on each project path to show inline previews.");
 
       return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
