@@ -58,17 +58,9 @@ export class FlowDriver {
       .catch(() => false);
 
     if (onDashboard) {
-      // Try to open the first existing project
-      const existingProject = this.page.locator('a[href*="project/"]').first();
-      const hasExisting = await existingProject.isVisible().catch(() => false);
-
-      if (hasExisting) {
-        await existingProject.click();
-        console.error("[google-flow-mcp] Reusing existing Flow project");
-      } else {
-        await this.page.locator(DASHBOARD_SELECTOR).click();
-        console.error("[google-flow-mcp] Created new Flow project");
-      }
+      // Always create a new project to start with a clean canvas
+      await this.page.locator(DASHBOARD_SELECTOR).click();
+      console.error("[google-flow-mcp] Created new Flow project");
 
       await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
     } else {
