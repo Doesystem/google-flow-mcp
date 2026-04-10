@@ -111,9 +111,6 @@ export class FlowDriver {
     // Wait for prompt field to reset to placeholder (signals UI is ready for next prompt)
     await this.waitForPromptReset();
 
-    // Small delay so sequential submissions are more likely to finish in order
-    await this.page.waitForTimeout(1_000);
-
     const jobId = `job-${++this.jobCounter}`;
     this.pendingJobs.push({ id: jobId, prompt: options.prompt, expectedCount: count, beforeSrcs });
 
