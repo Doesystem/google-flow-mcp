@@ -40,7 +40,7 @@ export interface PendingJob {
 export class FlowDriver {
   private context: BrowserContext;
   private page: Page | null = null;
-  pendingJobs: PendingJob[] = [];
+  private pendingJobs: PendingJob[] = [];
   private jobCounter = 0;
 
   constructor(context: BrowserContext) {
@@ -262,7 +262,7 @@ export class FlowDriver {
     }
   }
 
-  async waitAndDownloadNewImages(
+  private async waitAndDownloadNewImages(
     expectedCount: number,
     existingSrcs: Set<string>
   ): Promise<GeneratedImage[]> {
@@ -315,6 +315,76 @@ export class FlowDriver {
     } catch {
       console.error("[google-flow-mcp] Could not upload images");
     }
+  }
+
+  get hasPendingJobs(): boolean {
+    return this.pendingJobs.length > 0;
+  }
+
+  async collectAllImages(): Promise<Map<string, GeneratedImage[]>> {
+    if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
+
+    if (this.pendingJobs.length === 0) {
+      return new Map();
+    }
+
+    const totalExpected = this.pendingJobs.reduce((sum, job) => sum + job.expectedCount, 0);
+
+    // Build union of all "before" srcs — use the FIRST job's snapshot
+    // since it was taken before any of the pending generations started
+    const allBeforeSrcs = this.pendingJobs[0].beforeSrcs;
+
+    console.error(`[google-flow-mcp] Collecting images: waiting for ${totalExpected} new image(s) across ${this.pendingJobs.length} job(s)`);
+
+    // Wait for new images to appear
+    const deadline = Date.now() + 180_000; // 3 minute timeout for multiple generations
+    let newSrcs: string[] = [];
+
+    while (newSrcs.length < totalExpected && Date.now() < deadline) {
+      await this.page.waitForTimeout(5_000);
+      const allElements = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
+      newSrcs = [];
+      for (const el of allElements) {
+        const src = await el.getAttribute("src");
+        if (src && !allBeforeSrcs.has(src)) {
+          newSrcs.push(src);
+        }
+      }
+      console.error(`[google-flow-mcp]   Found ${newSrcs.length}/${totalExpected} new image(s)...`);
+    }
+
+    console.error(`[google-flow-mcp] Collection complete: ${newSrcs.length} new image(s)`);
+
+    // Download all new images
+    const allDownloaded: GeneratedImage[] = [];
+    for (let i = 0; i < newSrcs.length; i++) {
+      try {
+        const url = newSrcs[i].startsWith("http") ? newSrcs[i] : `https://labs.google${newSrcs[i]}`;
+        const response = await this.page.request.get(url);
+        const buffer = Buffer.from(await response.body());
+        allDownloaded.push({ buffer, index: i + 1 });
+      } catch (err) {
+        console.error(`[google-flow-mcp] Failed to download image ${i + 1}:`, err);
+      }
+    }
+
+    // Group downloaded images by job (in submission order)
+    const results = new Map<string, GeneratedImage[]>();
+    let offset = 0;
+    for (const job of this.pendingJobs) {
+      const jobImages: GeneratedImage[] = [];
+      for (let i = 0; i < job.expectedCount && offset + i < allDownloaded.length; i++) {
+        const img = allDownloaded[offset + i];
+        jobImages.push({ buffer: img.buffer, index: i + 1 });
+      }
+      results.set(job.id, jobImages);
+      offset += job.expectedCount;
+    }
+
+    // Clear pending jobs
+    this.pendingJobs = [];
+
+    return results;
   }
 
   async close(): Promise<void> {
