@@ -70,44 +70,86 @@ server.tool(
         aspectRatio: aspect_ratio,
         count,
       });
-      // Collect images for this job (Task 2 will replace this with collectAllImages)
-      const job = driver.pendingJobs.find((j) => j.id === jobId);
-      const images = job
-        ? await driver.waitAndDownloadNewImages(job.expectedCount, job.beforeSrcs)
-        : [];
-      driver.pendingJobs = driver.pendingJobs.filter((j) => j.id !== jobId);
-
-      const slug = slugify(prompt);
-      const tempPaths: string[] = [];
-
-      for (const image of images) {
-        const tempPath = buildTempPath(slug, image.index);
-        await saveImage(image.buffer, tempPath);
-        tempPaths.push(tempPath);
-      }
 
       return {
         content: [
           {
             type: "text" as const,
             text: [
-              `Generated ${images.length} variation(s) for: "${prompt}"`,
+              `Generation submitted as ${jobId}: "${prompt}" (${count ?? 2} variation(s))`,
               "",
-              "Temp preview paths:",
-              ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
-              "",
-              "Use the Read tool on each path to show inline previews.",
-              "Then ask the user which to keep and call save_selected_images.",
+              "Image is now generating in the background.",
+              "Submit more generate_image calls, or call collect_images to wait for results.",
             ].join("\n"),
           },
         ],
       };
     } catch (error) {
-      // Reset driver on failure so next call gets a fresh one
       activeDriver = null;
       const message = error instanceof Error ? error.message : String(error);
       return {
-        content: [{ type: "text" as const, text: `Error generating image: ${message}` }],
+        content: [{ type: "text" as const, text: `Error submitting generation: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+server.tool(
+  "collect_images",
+  "Wait for all pending image generations to complete and download the results. Call this after submitting one or more generate_image requests. Returns all generated images grouped by job, saved to temp folders for preview.",
+  {},
+  async () => {
+    try {
+      const driver = await getDriver();
+
+      if (!driver.hasPendingJobs) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "No pending generations to collect. Submit generate_image calls first.",
+            },
+          ],
+        };
+      }
+
+      const results = await driver.collectAllImages();
+
+      const allTempPaths: { jobId: string; paths: string[] }[] = [];
+
+      for (const [jobId, images] of results) {
+        const slug = slugify(jobId);
+        const paths: string[] = [];
+        for (const image of images) {
+          const tempPath = buildTempPath(slug, image.index);
+          await saveImage(image.buffer, tempPath);
+          paths.push(tempPath);
+        }
+        allTempPaths.push({ jobId, paths });
+      }
+
+      const lines: string[] = [`Collected ${results.size} generation(s):`, ""];
+
+      for (const { jobId, paths } of allTempPaths) {
+        lines.push(`${jobId} (${paths.length} image(s)):`);
+        for (let i = 0; i < paths.length; i++) {
+          lines.push(`  ${i + 1}. ${paths[i]}`);
+        }
+        lines.push("");
+      }
+
+      lines.push("Use the Read tool on each path to show inline previews.");
+      lines.push("Then ask the user which to keep and call save_selected_images.");
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    } catch (error) {
+      activeDriver = null;
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: "text" as const, text: `Error collecting images: ${message}` }],
         isError: true,
       };
     }
@@ -244,12 +286,12 @@ server.tool(
 
 server.tool(
   "regen_image",
-  "Regenerate from an existing generated image in the current Flow session. Clicks on the image by index to open the edit view, then applies a new prompt. Use this to iterate on a previously generated image without re-uploading.",
+  "Regenerate from an existing generated image in the current Flow session. Clicks on the image by index to open the edit view, then optionally applies a new prompt. Omit the prompt to regenerate a new variation with the original prompt. Use this to iterate on a previously generated image without re-uploading.",
   {
     image_index: z
       .number()
       .describe("1-based index of the generated image to regen from (e.g. 1 for first image)"),
-    prompt: z.string().describe("New prompt describing what to change or regenerate"),
+    prompt: z.string().optional().describe("New prompt to edit the image. Omit to regenerate a new variation with the original prompt."),
     aspect_ratio: z
       .string()
       .optional()
@@ -265,7 +307,7 @@ server.tool(
         aspectRatio: aspect_ratio,
       });
 
-      const slug = slugify(prompt);
+      const slug = slugify(prompt ?? `regen-${image_index}`);
       const tempPaths: string[] = [];
 
       for (const image of images) {
@@ -279,7 +321,9 @@ server.tool(
           {
             type: "text" as const,
             text: [
-              `Regenerated from image #${image_index} with prompt: "${prompt}"`,
+              prompt
+                ? `Regenerated from image #${image_index} with prompt: "${prompt}"`
+                : `Regenerated a new variation from image #${image_index}`,
               "",
               "Temp preview paths:",
               ...tempPaths.map((p, i) => `  ${i + 1}. ${p}`),
