@@ -206,8 +206,19 @@ export class FlowDriver {
     await this.page!.keyboard.press("Backspace");
     await this.page!.waitForTimeout(300);
 
-    // Type character by character with delay — required for Slate to register input in headless mode
-    await this.page!.keyboard.type(prompt, { delay: 50 });
+    // Paste via clipboard — most reliable way to insert text into Slate editors
+    // keyboard.type() often fails in headless because Slate ignores synthetic key events
+    await this.page!.evaluate((text) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", text);
+      const pasteEvent = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      });
+      const el = document.querySelector('[data-slate-editor="true"]');
+      if (el) el.dispatchEvent(pasteEvent);
+    }, prompt);
     await this.page!.waitForTimeout(500);
 
     const typed = await editor.textContent();
