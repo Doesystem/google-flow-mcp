@@ -190,9 +190,11 @@ export class FlowDriver {
   private async typePrompt(prompt: string): Promise<void> {
     const editor = this.page!.locator(PROMPT_SELECTOR);
     await editor.click();
-    await this.page!.keyboard.press("Meta+a");
+    await this.page!.keyboard.press("Control+a");
     await this.page!.keyboard.press("Backspace");
     await this.page!.keyboard.type(prompt, { delay: 10 });
+    const typed = await editor.textContent();
+    console.error(`[google-flow-mcp] Prompt field content after typing: "${typed?.slice(0, 80)}"`);
   }
 
   private async setAspectRatio(ratio: string): Promise<void> {
@@ -226,10 +228,11 @@ export class FlowDriver {
     }
     console.error(`[google-flow-mcp] Visible [role=tab] elements: ${tabTexts.join(", ") || "(none)"}`);
 
-    // Count buttons are tabs with text "1x"-"4x"
-    const countButton = this.page!.locator(`button[role="tab"]:text-is("${count}x")`);
+    // Flow uses "1x" for count=1, "x2"/"x3"/"x4" for count=2-4
+    const label = count === 1 ? "1x" : `x${count}`;
+    const countButton = this.page!.locator(`button[role="tab"]:text-is("${label}")`);
     const btnCount = await countButton.count();
-    console.error(`[google-flow-mcp] Found ${btnCount} tab button(s) matching "${count}x"`);
+    console.error(`[google-flow-mcp] Found ${btnCount} tab button(s) matching "${label}"`);
     try {
       await countButton.click({ timeout: 5_000 });
       console.error(`[google-flow-mcp] Set output count to ${count}`);
@@ -271,6 +274,22 @@ export class FlowDriver {
         }
       }
       console.error(`[google-flow-mcp]   Polling: found ${newSrcs.length}/${expectedCount} new image(s) (total imgs on page: ${allElements.length})`);
+
+      // On first poll, dump all img srcs to help diagnose selector issues
+      if (newSrcs.length === 0 && allElements.length === 0) {
+        const allImgs = await this.page!.locator("img").all();
+        const srcs: string[] = [];
+        for (const img of allImgs) {
+          const src = await img.getAttribute("src");
+          if (src) srcs.push(src.slice(0, 120));
+        }
+        if (srcs.length > 0) {
+          console.error(`[google-flow-mcp]   All img srcs on page (${srcs.length}):`);
+          srcs.forEach((s, i) => console.error(`    [${i}] ${s}`));
+        } else {
+          console.error(`[google-flow-mcp]   No <img> elements found on page at all`);
+        }
+      }
     }
 
     console.error(`[google-flow-mcp] Found ${newSrcs.length} new generated image(s)`);
