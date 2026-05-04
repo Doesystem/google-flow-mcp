@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import http from "http";
 import path from "path";
-import { readFile } from "fs/promises";
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { tmpdir } from "os";
+import crypto from "crypto";
 import { AuthManager } from "./auth-manager.js";
 import { FlowDriver } from "./flow-driver.js";
 import {
@@ -77,6 +79,23 @@ async function parseJson(req: http.IncomingMessage): Promise<unknown> {
   const buf = await readBody(req);
   if (!buf.length) return {};
   return JSON.parse(buf.toString("utf-8"));
+}
+
+/**
+ * Download an image from a URL and save it to a temp file.
+ * Returns the local file path.
+ */
+async function downloadToTemp(url: string): Promise<string> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download image from URL: ${res.status} ${res.statusText}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const dir = path.join(tmpdir(), "google-flow-url");
+  await mkdir(dir, { recursive: true });
+  const ext = url.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
+  const filePath = path.join(dir, `${crypto.randomBytes(6).toString("hex")}.${ext}`);
+  await writeFile(filePath, buffer);
+  console.error(`[google-flow-mcp] Downloaded URL to temp: ${filePath}`);
+  return filePath;
 }
 
 // ─── Route handlers ───────────────────────────────────────────────────────────
@@ -219,15 +238,19 @@ async function handleSave(req: http.IncomingMessage, res: http.ServerResponse): 
 
 /**
  * POST /edit
- * Body: { image_paths, prompt, aspect_ratio?, project_dir }
+ * Body: { image_paths?, image_urls?, prompt, aspect_ratio?, project_dir }
+ * At least one of image_paths or image_urls is required.
  * Returns: { success, images: [{ project_path, archive_path }] }
  */
 async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
-  const { image_paths, prompt, aspect_ratio, project_dir } = body;
+  const { image_paths, image_urls, prompt, aspect_ratio, project_dir } = body;
 
-  if (!Array.isArray(image_paths) || image_paths.length === 0) {
-    return sendError(res, 400, "image_paths must be a non-empty array");
+  const hasPaths = Array.isArray(image_paths) && image_paths.length > 0;
+  const hasUrls = Array.isArray(image_urls) && image_urls.length > 0;
+
+  if (!hasPaths && !hasUrls) {
+    return sendError(res, 400, "image_paths or image_urls is required");
   }
   if (typeof prompt !== "string" || !prompt.trim()) {
     return sendError(res, 400, "prompt is required");
@@ -237,9 +260,19 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
   }
 
   try {
+    // Download URL images to temp files first (outside the browser queue)
+    const downloadedPaths: string[] = hasUrls
+      ? await Promise.all((image_urls as string[]).map(downloadToTemp))
+      : [];
+
+    const allPaths = [
+      ...(hasPaths ? (image_paths as string[]) : []),
+      ...downloadedPaths,
+    ];
+
     const driver = await getDriver();
     const images = await enqueue(() => driver.edit({
-      imagePaths: image_paths as string[],
+      imagePaths: allPaths,
       prompt,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
     }));
