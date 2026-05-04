@@ -80,10 +80,19 @@ export class AuthManager {
       channel: "chrome",
       headless: true,
       ignoreDefaultArgs: AUTOMATION_FLAGS,
-      args: ["--disable-blink-features=AutomationControlled"],
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        // These flags help headless Chrome behave closer to headful
+        // and allow keyboard/input events to work properly with React/Slate editors
+        "--window-size=1280,900",
+        "--force-device-scale-factor=1",
+      ],
     });
 
-    this.context = await this.browser!.newContext({ storageState: state });
+    this.context = await this.browser!.newContext({
+      storageState: state,
+      viewport: { width: 1280, height: 900 },
+    });
 
     await this.context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });

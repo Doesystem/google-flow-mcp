@@ -195,14 +195,21 @@ export class FlowDriver {
 
   private async typePrompt(prompt: string): Promise<void> {
     const editor = this.page!.locator(PROMPT_SELECTOR);
+
+    // Click to focus
     await editor.click();
-    // Clear existing content
+    await this.page!.waitForTimeout(500);
+
+    // Select all and delete existing content
     await this.page!.keyboard.press("Control+a");
+    await this.page!.waitForTimeout(200);
     await this.page!.keyboard.press("Backspace");
     await this.page!.waitForTimeout(300);
-    // Type using fill() which triggers proper input events on Slate editors
-    await editor.fill(prompt);
-    await this.page!.waitForTimeout(300);
+
+    // Type character by character with delay — required for Slate to register input in headless mode
+    await this.page!.keyboard.type(prompt, { delay: 50 });
+    await this.page!.waitForTimeout(500);
+
     const typed = await editor.textContent();
     console.error(`[google-flow-mcp] Prompt field content after typing: "${typed?.slice(0, 80)}"`);
   }
