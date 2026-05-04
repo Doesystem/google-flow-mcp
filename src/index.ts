@@ -1,17 +1,16 @@
 #!/usr/bin/env node
 import http from "http";
 import path from "path";
-import { readFile, writeFile, mkdir } from "fs/promises";
+import { mkdir, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import crypto from "crypto";
 import { AuthManager } from "./auth-manager.js";
 import { FlowDriver } from "./flow-driver.js";
 import {
-  slugify,
-  nextAvailableName,
+  generateJobId,
+  buildJobImagePath,
   saveImage,
-  cleanTemp,
-  getArchiveBaseDir,
+  getOutputBase,
 } from "./file-manager.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
@@ -29,26 +28,16 @@ let queueTail: Promise<void> = Promise.resolve();
 
 function enqueue<T>(fn: () => Promise<T>): Promise<T> {
   const result = queueTail.then(() => fn());
-  // Advance the tail — swallow errors so the queue keeps moving
-  queueTail = result.then(
-    () => {},
-    () => {}
-  );
+  queueTail = result.then(() => {}, () => {});
   return result;
 }
 
 async function getDriver(): Promise<FlowDriver> {
   if (activeDriver) return activeDriver;
-
   const context = await authManager.getAuthenticatedContext();
   activeDriver = new FlowDriver(context);
   await activeDriver.init();
   return activeDriver;
-}
-
-function getProjectName(): string | null {
-  const cwd = process.cwd();
-  return path.basename(cwd) || null;
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -87,7 +76,7 @@ async function parseJson(req: http.IncomingMessage): Promise<unknown> {
  */
 async function downloadToTemp(url: string): Promise<string> {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to download image from URL: ${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error(`Failed to download image: ${res.status} ${res.statusText} — ${url}`);
   const buffer = Buffer.from(await res.arrayBuffer());
   const dir = path.join(tmpdir(), "google-flow-url");
   await mkdir(dir, { recursive: true });
@@ -102,31 +91,37 @@ async function downloadToTemp(url: string): Promise<string> {
 
 /**
  * POST /generate
- * Body: { prompt, image_paths?, aspect_ratio?, count? }
- * Returns: { success, job_id, message }
+ * Body: { prompt, image_paths?, image_urls?, aspect_ratio?, count? }
+ * Returns: { success, job_id }
  */
 async function handleGenerate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
-  const { prompt, image_paths, aspect_ratio, count } = body;
+  const { prompt, image_paths, image_urls, aspect_ratio, count } = body;
 
   if (typeof prompt !== "string" || !prompt.trim()) {
     return sendError(res, 400, "prompt is required");
   }
 
   try {
+    // Download URL images before entering the browser queue
+    const downloadedPaths: string[] = Array.isArray(image_urls)
+      ? await Promise.all((image_urls as string[]).map(downloadToTemp))
+      : [];
+
+    const allPaths = [
+      ...(Array.isArray(image_paths) ? (image_paths as string[]) : []),
+      ...downloadedPaths,
+    ];
+
     const driver = await getDriver();
     const jobId = await enqueue(() => driver.submitGeneration({
       prompt,
-      imagePaths: Array.isArray(image_paths) ? (image_paths as string[]) : undefined,
+      imagePaths: allPaths.length > 0 ? allPaths : undefined,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
       count: typeof count === "number" ? count : 2,
     }));
 
-    send(res, 202, {
-      success: true,
-      job_id: jobId,
-      message: `Generation submitted as ${jobId}: "${prompt}"`,
-    });
+    send(res, 202, { success: true, job_id: jobId });
   } catch (error) {
     activeDriver = null;
     sendError(res, 500, error instanceof Error ? error.message : String(error));
@@ -135,49 +130,40 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
 
 /**
  * POST /collect
- * Body: { project_dir }
- * Returns: { success, images: [{ project_path, archive_path }] }
+ * Body: {} (empty)
+ * Returns: { success, jobs: [{ job_id, images: [{ index, path }] }] }
  */
 async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = await parseJson(req) as Record<string, unknown>;
-  const { project_dir } = body;
-
-  if (typeof project_dir !== "string" || !project_dir.trim()) {
-    return sendError(res, 400, "project_dir is required");
-  }
-
   try {
     const driver = await getDriver();
 
     if (!driver.hasPendingJobs) {
-      return send(res, 200, {
-        success: true,
-        images: [],
-        message: "No pending generations to collect.",
-      });
+      return send(res, 200, { success: true, jobs: [], message: "No pending generations." });
     }
 
-    const images = await enqueue(() => driver.collectAllImages());
-    const projectName = getProjectName();
-    const projectImagesDir = path.join(project_dir, "generated-images");
-    const saved: { project_path: string; archive_path: string }[] = [];
+    const { images, jobIds } = await enqueue(() => driver.collectAllImages());
+    const outputBase = getOutputBase();
+
+    // Group images by job_id
+    const jobMap = new Map<string, { index: number; path: string }[]>();
+    for (const jobId of jobIds) {
+      jobMap.set(jobId, []);
+    }
 
     for (const image of images) {
-      const smartName = `generation-${image.index}`;
-      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-
-      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
-
-      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-      const archivePath = path.join(archiveDir, `${archiveName}.png`);
-
-      await saveImage(image.buffer, projectPath);
-      await saveImage(image.buffer, archivePath);
-      saved.push({ project_path: projectPath, archive_path: archivePath });
+      const jobId = image.jobId;
+      const filePath = buildJobImagePath(jobId, image.index);
+      await saveImage(image.buffer, filePath);
+      jobMap.get(jobId)?.push({ index: image.index, path: filePath });
     }
 
-    send(res, 200, { success: true, images: saved });
+    const jobs = Array.from(jobMap.entries()).map(([job_id, imgs]) => ({
+      job_id,
+      images: imgs,
+    }));
+
+    console.error(`[google-flow-mcp] Saved images to: ${outputBase}`);
+    send(res, 200, { success: true, jobs });
   } catch (error) {
     activeDriver = null;
     sendError(res, 500, error instanceof Error ? error.message : String(error));
@@ -185,66 +171,14 @@ async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse
 }
 
 /**
- * POST /save
- * Body: { temp_paths, smart_name, project_dir }
- * Returns: { success, saved: [{ project_path, archive_path }] }
- */
-async function handleSave(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  const body = await parseJson(req) as Record<string, unknown>;
-  const { temp_paths, smart_name, project_dir } = body;
-
-  if (!Array.isArray(temp_paths) || temp_paths.length === 0) {
-    return sendError(res, 400, "temp_paths must be a non-empty array");
-  }
-  if (typeof smart_name !== "string" || !smart_name.trim()) {
-    return sendError(res, 400, "smart_name is required");
-  }
-  if (typeof project_dir !== "string" || !project_dir.trim()) {
-    return sendError(res, 400, "project_dir is required");
-  }
-
-  try {
-    const projectName = getProjectName();
-    const projectImagesDir = path.join(project_dir, "generated-images");
-    const safeName = slugify(smart_name);
-    const saved: { project_path: string; archive_path: string }[] = [];
-
-    for (let i = 0; i < temp_paths.length; i++) {
-      const buffer = await readFile(temp_paths[i] as string);
-      const variationIndex = temp_paths.length > 1 ? i + 1 : undefined;
-
-      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-      const archiveName = variationIndex !== undefined
-        ? `${safeName}-${variationIndex}`
-        : nextAvailableName(archiveDir, safeName).name;
-      const projectFileName = variationIndex !== undefined
-        ? `${safeName}-${variationIndex}`
-        : nextAvailableName(projectImagesDir, safeName).name;
-
-      const archivePath = path.join(archiveDir, `${archiveName}.png`);
-      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-
-      await saveImage(Buffer.from(buffer), archivePath);
-      await saveImage(Buffer.from(buffer), projectPath);
-      saved.push({ project_path: projectPath, archive_path: archivePath });
-    }
-
-    await cleanTemp();
-    send(res, 200, { success: true, saved });
-  } catch (error) {
-    sendError(res, 500, error instanceof Error ? error.message : String(error));
-  }
-}
-
-/**
  * POST /edit
- * Body: { image_paths?, image_urls?, prompt, aspect_ratio?, project_dir }
+ * Body: { image_paths?, image_urls?, prompt, aspect_ratio? }
  * At least one of image_paths or image_urls is required.
- * Returns: { success, images: [{ project_path, archive_path }] }
+ * Returns: { success, job_id, images: [{ index, path }] }
  */
 async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
-  const { image_paths, image_urls, prompt, aspect_ratio, project_dir } = body;
+  const { image_paths, image_urls, prompt, aspect_ratio } = body;
 
   const hasPaths = Array.isArray(image_paths) && image_paths.length > 0;
   const hasUrls = Array.isArray(image_urls) && image_urls.length > 0;
@@ -255,12 +189,8 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
   if (typeof prompt !== "string" || !prompt.trim()) {
     return sendError(res, 400, "prompt is required");
   }
-  if (typeof project_dir !== "string" || !project_dir.trim()) {
-    return sendError(res, 400, "project_dir is required");
-  }
 
   try {
-    // Download URL images to temp files first (outside the browser queue)
     const downloadedPaths: string[] = hasUrls
       ? await Promise.all((image_urls as string[]).map(downloadToTemp))
       : [];
@@ -270,32 +200,23 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
       ...downloadedPaths,
     ];
 
+    const jobId = generateJobId();
     const driver = await getDriver();
     const images = await enqueue(() => driver.edit({
       imagePaths: allPaths,
       prompt,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
+      jobId,
     }));
 
-    const smartName = slugify(prompt);
-    const projectName = getProjectName();
-    const projectImagesDir = path.join(project_dir, "generated-images");
-    const saved: { project_path: string; archive_path: string }[] = [];
-
+    const saved: { index: number; path: string }[] = [];
     for (const image of images) {
-      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
-
-      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-      const archivePath = path.join(archiveDir, `${archiveName}.png`);
-
-      await saveImage(image.buffer, projectPath);
-      await saveImage(image.buffer, archivePath);
-      saved.push({ project_path: projectPath, archive_path: archivePath });
+      const filePath = buildJobImagePath(jobId, image.index);
+      await saveImage(image.buffer, filePath);
+      saved.push({ index: image.index, path: filePath });
     }
 
-    send(res, 200, { success: true, images: saved });
+    send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
     sendError(res, 500, error instanceof Error ? error.message : String(error));
@@ -304,47 +225,35 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
 
 /**
  * POST /regen
- * Body: { image_index, prompt?, aspect_ratio?, project_dir }
- * Returns: { success, images: [{ project_path, archive_path }] }
+ * Body: { image_index, prompt?, aspect_ratio? }
+ * Returns: { success, job_id, images: [{ index, path }] }
  */
 async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
-  const { image_index, prompt, aspect_ratio, project_dir } = body;
+  const { image_index, prompt, aspect_ratio } = body;
 
   if (typeof image_index !== "number") {
     return sendError(res, 400, "image_index must be a number");
   }
-  if (typeof project_dir !== "string" || !project_dir.trim()) {
-    return sendError(res, 400, "project_dir is required");
-  }
 
   try {
+    const jobId = generateJobId();
     const driver = await getDriver();
     const images = await enqueue(() => driver.regen({
       imageIndex: image_index,
       prompt: typeof prompt === "string" ? prompt : undefined,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
+      jobId,
     }));
 
-    const smartName = slugify(typeof prompt === "string" ? prompt : `regen-${image_index}`);
-    const projectName = getProjectName();
-    const projectImagesDir = path.join(project_dir, "generated-images");
-    const saved: { project_path: string; archive_path: string }[] = [];
-
+    const saved: { index: number; path: string }[] = [];
     for (const image of images) {
-      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
-
-      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-      const archivePath = path.join(archiveDir, `${archiveName}.png`);
-
-      await saveImage(image.buffer, projectPath);
-      await saveImage(image.buffer, archivePath);
-      saved.push({ project_path: projectPath, archive_path: archivePath });
+      const filePath = buildJobImagePath(jobId, image.index);
+      await saveImage(image.buffer, filePath);
+      saved.push({ index: image.index, path: filePath });
     }
 
-    send(res, 200, { success: true, images: saved });
+    send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
     sendError(res, 500, error instanceof Error ? error.message : String(error));
@@ -357,9 +266,8 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const method = req.method ?? "";
   const url = req.url ?? "";
 
-  // Health check
   if (method === "GET" && url === "/health") {
-    return send(res, 200, { status: "ok" });
+    return send(res, 200, { status: "ok", output_dir: getOutputBase() });
   }
 
   if (method !== "POST") {
@@ -369,9 +277,8 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
   try {
     if (url === "/generate") return await handleGenerate(req, res);
     if (url === "/collect") return await handleCollect(req, res);
-    if (url === "/save") return await handleSave(req, res);
-    if (url === "/edit") return await handleEdit(req, res);
-    if (url === "/regen") return await handleRegen(req, res);
+    if (url === "/edit")     return await handleEdit(req, res);
+    if (url === "/regen")    return await handleRegen(req, res);
 
     sendError(res, 404, `Unknown endpoint: ${url}`);
   } catch (error) {
@@ -398,11 +305,11 @@ async function main(): Promise<void> {
 
   server.listen(PORT, () => {
     console.log(`[google-flow-mcp] REST API listening on http://localhost:${PORT}`);
+    console.log(`[google-flow-mcp] Output directory: ${getOutputBase()}`);
     console.log(`[google-flow-mcp] Endpoints:`);
     console.log(`  GET  /health`);
     console.log(`  POST /generate`);
     console.log(`  POST /collect`);
-    console.log(`  POST /save`);
     console.log(`  POST /edit`);
     console.log(`  POST /regen`);
   });

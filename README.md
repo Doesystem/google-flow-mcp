@@ -2,6 +2,8 @@
 
 REST API server that automates [Google Flow](https://labs.google/fx/tools/flow) image generation via browser automation (Playwright). Exposes generate, collect, edit, and regen as simple HTTP endpoints.
 
+All generated images are saved to `~/GoogleFlow/{job_id}/`.
+
 ## Requirements
 
 - Node.js 18+
@@ -47,10 +49,36 @@ PORT=8080 node dist/index.js
 ### Using pm2
 
 ```bash
-pm2 start dist/index.js --name google-flow-mcp
+pm2 start ecosystem.config.cjs
 pm2 save
 pm2 startup
 ```
+
+Common pm2 commands:
+
+```bash
+pm2 logs google-flow-mcp
+pm2 restart google-flow-mcp
+pm2 stop google-flow-mcp
+pm2 status
+```
+
+---
+
+## Output
+
+All images are saved to:
+
+```
+~/GoogleFlow/
+  job-20260505-143022/
+    1.png
+    2.png
+  job-20260505-150301/
+    1.png
+```
+
+Each job gets its own folder named by timestamp. No configuration needed.
 
 ---
 
@@ -59,9 +87,8 @@ pm2 startup
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `POST` | `/generate` | Submit an image generation job |
-| `POST` | `/collect` | Wait for pending jobs and save results |
-| `POST` | `/save` | Save selected images from temp to project |
+| `POST` | `/generate` | Submit an image generation job (non-blocking) |
+| `POST` | `/collect` | Wait for all pending jobs and save results |
 | `POST` | `/edit` | Edit images with a new prompt |
 | `POST` | `/regen` | Regenerate a variation from an existing image |
 
@@ -71,9 +98,8 @@ pm2 startup
 
 ### `GET /health`
 
-```
-200 OK
-{ "status": "ok" }
+```json
+{ "status": "ok", "output_dir": "/Users/me/GoogleFlow" }
 ```
 
 ---
@@ -88,6 +114,7 @@ Submit a generation job. Returns immediately with a `job_id` — call `/collect`
 |---|---|---|---|
 | `prompt` | string | ✅ | Description of the image to generate |
 | `image_paths` | string[] | — | Local file paths of reference images |
+| `image_urls` | string[] | — | URLs of reference images (downloaded automatically) |
 | `aspect_ratio` | string | — | `1:1`, `4:3`, `3:4`, `16:9`, `9:16` |
 | `count` | number | — | Number of variations (1–4, default: `2`) |
 
@@ -104,8 +131,7 @@ curl -X POST http://localhost:3000/generate \
 ```json
 {
   "success": true,
-  "job_id": "job-1",
-  "message": "Generation submitted as job-1: \"a cat in watercolor style\""
+  "job_id": "job-20260505-143022"
 }
 ```
 
@@ -113,20 +139,13 @@ curl -X POST http://localhost:3000/generate \
 
 ### `POST /collect`
 
-Wait for all pending generations to finish, then download and save images.
-
-**Body**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `project_dir` | string | ✅ | Root directory of your project |
+Wait for all pending generations to finish, then download and save images.  
+No body required.
 
 **Example**
 
 ```bash
-curl -X POST http://localhost:3000/collect \
-  -H "Content-Type: application/json" \
-  -d '{"project_dir": "C:/Users/me/my-project"}'
+curl -X POST http://localhost:3000/collect
 ```
 
 **Response `200`**
@@ -134,58 +153,13 @@ curl -X POST http://localhost:3000/collect \
 ```json
 {
   "success": true,
-  "images": [
+  "jobs": [
     {
-      "project_path": "C:/Users/me/my-project/generated-images/generation-1.png",
-      "archive_path": "C:/Users/me/Downloads/Google Flow/my-project/generation-1.png"
-    },
-    {
-      "project_path": "C:/Users/me/my-project/generated-images/generation-2.png",
-      "archive_path": "C:/Users/me/Downloads/Google Flow/my-project/generation-2.png"
-    }
-  ]
-}
-```
-
-Images are saved to two locations:
-- `{project_dir}/generated-images/` — inside your project
-- `~/Downloads/Google Flow/{project_name}/` — archive
-
----
-
-### `POST /save`
-
-Save specific images from temp storage to the project and archive. Call this after previewing results from `/collect` and picking the ones to keep. Cleans up temp files after saving.
-
-**Body**
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `temp_paths` | string[] | ✅ | Temp file paths returned by a previous collect |
-| `smart_name` | string | ✅ | Short descriptive name used as filename (e.g. `watercolor-cat`) |
-| `project_dir` | string | ✅ | Root directory of your project |
-
-**Example**
-
-```bash
-curl -X POST http://localhost:3000/save \
-  -H "Content-Type: application/json" \
-  -d '{
-    "temp_paths": ["/tmp/google-flow/watercolor-cat-abc1-1.png"],
-    "smart_name": "watercolor-cat",
-    "project_dir": "C:/Users/me/my-project"
-  }'
-```
-
-**Response `200`**
-
-```json
-{
-  "success": true,
-  "saved": [
-    {
-      "project_path": "C:/Users/me/my-project/generated-images/watercolor-cat.png",
-      "archive_path": "C:/Users/me/Downloads/Google Flow/my-project/watercolor-cat.png"
+      "job_id": "job-20260505-143022",
+      "images": [
+        { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png" },
+        { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png" }
+      ]
     }
   ]
 }
@@ -195,16 +169,18 @@ curl -X POST http://localhost:3000/save \
 
 ### `POST /edit`
 
-Upload one or more images and apply an edit prompt. Saves results directly (no separate collect step).
+Upload one or more images and apply an edit prompt. Saves results immediately — no separate `/collect` needed.
 
 **Body**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `image_paths` | string[] | ✅ | Local file paths of images to edit |
+| `image_paths` | string[] | — | Local file paths of images to edit |
+| `image_urls` | string[] | — | URLs of images to edit (downloaded automatically) |
 | `prompt` | string | ✅ | Description of the changes to apply |
 | `aspect_ratio` | string | — | `1:1`, `4:3`, `3:4`, `16:9`, `9:16` |
-| `project_dir` | string | ✅ | Root directory of your project |
+
+At least one of `image_paths` or `image_urls` is required.
 
 **Example**
 
@@ -212,9 +188,8 @@ Upload one or more images and apply an edit prompt. Saves results directly (no s
 curl -X POST http://localhost:3000/edit \
   -H "Content-Type: application/json" \
   -d '{
-    "image_paths": ["C:/Users/me/my-project/generated-images/generation-1.png"],
-    "prompt": "make it look like a painting",
-    "project_dir": "C:/Users/me/my-project"
+    "image_urls": ["https://example.com/photo.jpg"],
+    "prompt": "make it look like a painting"
   }'
 ```
 
@@ -223,11 +198,9 @@ curl -X POST http://localhost:3000/edit \
 ```json
 {
   "success": true,
+  "job_id": "job-20260505-150301",
   "images": [
-    {
-      "project_path": "C:/Users/me/my-project/generated-images/make-it-look-like-a-painting.png",
-      "archive_path": "C:/Users/me/Downloads/Google Flow/my-project/make-it-look-like-a-painting.png"
-    }
+    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-150301/1.png" }
   ]
 }
 ```
@@ -245,18 +218,13 @@ Regenerate a variation from an image already generated in the current session. O
 | `image_index` | number | ✅ | 1-based index of the generated image to regen from |
 | `prompt` | string | — | New prompt — omit to regenerate with the original prompt |
 | `aspect_ratio` | string | — | `1:1`, `4:3`, `3:4`, `16:9`, `9:16` |
-| `project_dir` | string | ✅ | Root directory of your project |
 
 **Example**
 
 ```bash
 curl -X POST http://localhost:3000/regen \
   -H "Content-Type: application/json" \
-  -d '{
-    "image_index": 1,
-    "prompt": "same but at night",
-    "project_dir": "C:/Users/me/my-project"
-  }'
+  -d '{"image_index": 1, "prompt": "same but at night"}'
 ```
 
 **Response `200`**
@@ -264,11 +232,9 @@ curl -X POST http://localhost:3000/regen \
 ```json
 {
   "success": true,
+  "job_id": "job-20260505-150845",
   "images": [
-    {
-      "project_path": "C:/Users/me/my-project/generated-images/same-but-at-night.png",
-      "archive_path": "C:/Users/me/Downloads/Google Flow/my-project/same-but-at-night.png"
-    }
+    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-150845/1.png" }
   ]
 }
 ```
@@ -278,27 +244,11 @@ curl -X POST http://localhost:3000/regen \
 ## Typical Workflow
 
 ```
-1. POST /generate   → get job_id (non-blocking)
+1. POST /generate   → get job_id (non-blocking, Flow generates in background)
 2. POST /generate   → submit more jobs while first is generating (optional)
 3. POST /collect    → wait for all jobs, get saved image paths
 4. POST /regen      → iterate on a result you like
-5. POST /save       → keep only the images you want, clean up temp
-```
-
----
-
-## File Structure
-
-```
-~/.google-flow-mcp/
-  state.json          ← saved Google session (cookies + localStorage)
-  chrome-profile/     ← persistent Chrome profile used during auth
-
-~/Downloads/Google Flow/
-  {project_name}/     ← archive of all generated images
-
-{project_dir}/
-  generated-images/   ← images saved per project
+5. POST /edit       → apply edits with a new prompt
 ```
 
 ---
@@ -325,7 +275,7 @@ If you get a `500` with a session error, run `node dist/index.js auth` to re-aut
 
 ---
 
-## Project Structure
+## File Structure
 
 ```
 src/
@@ -337,4 +287,15 @@ tests/
   auth-manager.test.ts
   file-manager.test.ts
   flow-driver.test.ts
+ecosystem.config.cjs  ← pm2 config
+```
+
+---
+
+## Session Storage
+
+```
+~/.google-flow-mcp/
+  state.json          ← saved Google session (cookies + localStorage)
+  chrome-profile/     ← persistent Chrome profile used during auth
 ```

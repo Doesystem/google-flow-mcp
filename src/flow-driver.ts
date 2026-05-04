@@ -1,4 +1,5 @@
 import { BrowserContext, Page } from "playwright";
+import { generateJobId } from "./file-manager.js";
 
 const FLOW_URL = "https://labs.google/fx/tools/flow";
 const DASHBOARD_SELECTOR = 'button:has-text("New project")';
@@ -29,6 +30,7 @@ export interface RegenOptions {
 export interface GeneratedImage {
   buffer: Buffer;
   index: number;
+  jobId: string;
 }
 
 
@@ -43,7 +45,6 @@ export class FlowDriver {
   private context: BrowserContext;
   private page: Page | null = null;
   private pendingJobs: PendingJob[] = [];
-  private jobCounter = 0;
 
   constructor(context: BrowserContext) {
     this.context = context;
@@ -106,7 +107,7 @@ export class FlowDriver {
     // Wait for prompt field to reset to placeholder (signals UI is ready for next prompt)
     await this.waitForPromptReset();
 
-    const jobId = `job-${++this.jobCounter}`;
+    const jobId = generateJobId();
     this.pendingJobs.push({ id: jobId, prompt: options.prompt, expectedCount: count, beforeSrcs });
 
     console.error(`[google-flow-mcp] Submitted generation "${options.prompt}" as ${jobId} (expecting ${count} images)`);
@@ -126,7 +127,7 @@ export class FlowDriver {
     console.error("[google-flow-mcp] Prompt reset timeout — proceeding anyway");
   }
 
-  async edit(options: EditOptions): Promise<GeneratedImage[]> {
+  async edit(options: EditOptions & { jobId: string }): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
     await this.uploadImages(options.imagePaths);
@@ -146,11 +147,10 @@ export class FlowDriver {
 
     await this.typePrompt(options.prompt);
     await this.clickCreate();
-    const images = await this.waitAndDownloadNewImages(1, existingSrcs);
-    return images;
+    return this.waitAndDownloadNewImages(1, existingSrcs, options.jobId);
   }
 
-  async regen(options: RegenOptions): Promise<GeneratedImage[]> {
+  async regen(options: RegenOptions & { jobId: string }): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
     // Click on the nth generated image to open the edit view
@@ -188,8 +188,7 @@ export class FlowDriver {
       await this.typePrompt(options.prompt);
     }
     await this.clickCreate();
-    const images = await this.waitAndDownloadNewImages(1, existingSrcs);
-    return images;
+    return this.waitAndDownloadNewImages(1, existingSrcs, options.jobId);
   }
 
   private async openSettingsPanel(): Promise<void> {
@@ -290,7 +289,8 @@ export class FlowDriver {
 
   private async waitAndDownloadNewImages(
     expectedCount: number,
-    existingSrcs: Set<string>
+    existingSrcs: Set<string>,
+    jobId: string
   ): Promise<GeneratedImage[]> {
     // Poll for new images that weren't on the page before generation
     const deadline = Date.now() + 120_000;
@@ -319,7 +319,7 @@ export class FlowDriver {
         const response = await this.page!.request.get(url);
         console.error(`[google-flow-mcp] Download status: ${response.status()}`);
         const buffer = Buffer.from(await response.body());
-        images.push({ buffer, index: i + 1 });
+        images.push({ buffer, index: i + 1, jobId });
       } catch (err) {
         console.error(`[google-flow-mcp] Failed to download image ${i + 1}:`, err);
       }
@@ -350,21 +350,19 @@ export class FlowDriver {
     return this.pendingJobs.length > 0;
   }
 
-  async collectAllImages(): Promise<GeneratedImage[]> {
+  async collectAllImages(): Promise<{ images: GeneratedImage[]; jobIds: string[] }> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
     if (this.pendingJobs.length === 0) {
-      return [];
+      return { images: [], jobIds: [] };
     }
 
     const totalExpected = this.pendingJobs.reduce((sum, job) => sum + job.expectedCount, 0);
-
-    // Use the first job's snapshot as baseline (taken before any pending generation started)
     const allBeforeSrcs = this.pendingJobs[0].beforeSrcs;
+    const jobIds = this.pendingJobs.map(j => j.id);
 
     console.error(`[google-flow-mcp] Collecting images: waiting for ${totalExpected} new image(s)`);
 
-    // Wait for new images to appear
     const deadline = Date.now() + 180_000;
     let newSrcs: string[] = [];
 
@@ -383,23 +381,26 @@ export class FlowDriver {
 
     console.error(`[google-flow-mcp] Collection complete: ${newSrcs.length} new image(s)`);
 
-    // Download all new images (flat list, no job grouping — order is determined by Flow)
+    // Assign images to jobs in order (Flow returns images in submission order)
     const images: GeneratedImage[] = [];
-    for (let i = 0; i < newSrcs.length; i++) {
-      try {
-        const url = newSrcs[i].startsWith("http") ? newSrcs[i] : `https://labs.google${newSrcs[i]}`;
-        const response = await this.page.request.get(url);
-        const buffer = Buffer.from(await response.body());
-        images.push({ buffer, index: i + 1 });
-      } catch (err) {
-        console.error(`[google-flow-mcp] Failed to download image ${i + 1}:`, err);
+    let srcIndex = 0;
+    for (const job of this.pendingJobs) {
+      for (let i = 0; i < job.expectedCount && srcIndex < newSrcs.length; i++, srcIndex++) {
+        try {
+          const url = newSrcs[srcIndex].startsWith("http")
+            ? newSrcs[srcIndex]
+            : `https://labs.google${newSrcs[srcIndex]}`;
+          const response = await this.page.request.get(url);
+          const buffer = Buffer.from(await response.body());
+          images.push({ buffer, index: i + 1, jobId: job.id });
+        } catch (err) {
+          console.error(`[google-flow-mcp] Failed to download image for ${job.id}:`, err);
+        }
       }
     }
 
-    // Clear pending jobs
     this.pendingJobs = [];
-
-    return images;
+    return { images, jobIds };
   }
 
   async close(): Promise<void> {
