@@ -193,13 +193,28 @@ export class FlowDriver {
   }
 
   private async openSettingsPanel(): Promise<void> {
+    // Dump all visible buttons to help identify the correct selector
+    const allButtons = await this.page!.locator("button").all();
+    const buttonTexts: string[] = [];
+    for (const btn of allButtons) {
+      const text = (await btn.textContent())?.trim().replace(/\s+/g, " ") ?? "";
+      if (text) buttonTexts.push(`"${text}"`);
+    }
+    console.error(`[google-flow-mcp] Visible buttons on page: ${buttonTexts.join(", ")}`);
+
     // Click the model chip (e.g. "Nano Banana 2") to open settings
     const modelChip = this.page!.locator('button:has-text("Nano Banana")');
+    const chipCount = await modelChip.count();
+    console.error(`[google-flow-mcp] Found ${chipCount} button(s) matching "Nano Banana"`);
     try {
       await modelChip.click({ timeout: 5_000 });
       await this.page!.waitForTimeout(500);
+      console.error("[google-flow-mcp] Settings panel opened");
     } catch {
-      console.error("[google-flow-mcp] Could not open settings panel");
+      console.error("[google-flow-mcp] Could not open settings panel — dumping page HTML snippet");
+      const html = await this.page!.content();
+      // Print first 3000 chars to avoid flooding logs
+      console.error("[google-flow-mcp] PAGE HTML (first 3000 chars):\n" + html.slice(0, 3000));
     }
   }
 
@@ -239,10 +254,22 @@ export class FlowDriver {
       return;
     }
 
+    // Dump all tabs/buttons visible after settings panel opens
+    const allTabs = await this.page!.locator("[role='tab']").all();
+    const tabTexts: string[] = [];
+    for (const tab of allTabs) {
+      const text = (await tab.textContent())?.trim().replace(/\s+/g, " ") ?? "";
+      if (text) tabTexts.push(`"${text}"`);
+    }
+    console.error(`[google-flow-mcp] Visible [role=tab] elements: ${tabTexts.join(", ") || "(none)"}`);
+
     // Count buttons are Radix tabs with role="tab" and text "x1"-"x4"
     const countButton = this.page!.locator(`button[role="tab"]:text-is("x${count}")`);
+    const btnCount = await countButton.count();
+    console.error(`[google-flow-mcp] Found ${btnCount} tab button(s) matching "x${count}"`);
     try {
       await countButton.click({ timeout: 5_000 });
+      console.error(`[google-flow-mcp] Set output count to ${count}`);
     } catch {
       console.error(`[google-flow-mcp] Could not set output count to ${count}`);
     }
@@ -251,8 +278,11 @@ export class FlowDriver {
   private async clickCreate(): Promise<void> {
     // The submit button has text "arrow_forwardCreate" (material icon + text)
     const createBtn = this.page!.locator('button:has-text("Create")').last();
+    const btnCount = await createBtn.count();
+    console.error(`[google-flow-mcp] Found ${btnCount} button(s) matching "Create"`);
     try {
       await createBtn.click({ timeout: 5_000 });
+      console.error("[google-flow-mcp] Clicked Create button");
     } catch {
       console.error("[google-flow-mcp] Could not click Create button");
     }
@@ -276,6 +306,7 @@ export class FlowDriver {
           newSrcs.push(src);
         }
       }
+      console.error(`[google-flow-mcp]   Polling: found ${newSrcs.length}/${expectedCount} new image(s) (total imgs on page: ${allElements.length})`);
     }
 
     console.error(`[google-flow-mcp] Found ${newSrcs.length} new generated image(s)`);
@@ -284,7 +315,9 @@ export class FlowDriver {
     for (let i = 0; i < Math.min(newSrcs.length, expectedCount); i++) {
       try {
         const url = newSrcs[i].startsWith("http") ? newSrcs[i] : `https://labs.google${newSrcs[i]}`;
+        console.error(`[google-flow-mcp] Downloading image ${i + 1}: ${url}`);
         const response = await this.page!.request.get(url);
+        console.error(`[google-flow-mcp] Download status: ${response.status()}`);
         const buffer = Buffer.from(await response.body());
         images.push({ buffer, index: i + 1 });
       } catch (err) {

@@ -1,26 +1,18 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import http from "http";
 import path from "path";
 import { readFile } from "fs/promises";
 import { AuthManager } from "./auth-manager.js";
 import { FlowDriver } from "./flow-driver.js";
 import {
   slugify,
-  buildTempPath,
-  buildArchivePath,
-  buildProjectPath,
   nextAvailableName,
   saveImage,
   cleanTemp,
   getArchiveBaseDir,
 } from "./file-manager.js";
 
-const server = new McpServer({
-  name: "google-flow",
-  version: "1.0.0",
-});
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 const authManager = new AuthManager();
 
@@ -41,336 +33,306 @@ function getProjectName(): string | null {
   return path.basename(cwd) || null;
 }
 
-server.tool(
-  "generate_image",
-  "Generate images using Google Flow. Optionally upload reference images to guide generation. Returns variations saved to a temp folder for preview. Use save_selected_images to keep the ones the user picks.",
-  {
-    prompt: z.string().describe("Description of the image to generate"),
-    image_paths: z
-      .array(z.string())
-      .optional()
-      .describe("Optional array of reference image file paths to guide generation"),
-    aspect_ratio: z
-      .string()
-      .optional()
-      .describe("Aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
-    count: z
-      .number()
-      .optional()
-      .default(2)
-      .describe("Number of variations to generate (1-4, default: 2)"),
-  },
-  async ({ prompt, image_paths, aspect_ratio, count }) => {
-    try {
-      const driver = await getDriver();
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
-      const jobId = await driver.submitGeneration({
-        prompt,
-        imagePaths: image_paths,
-        aspectRatio: aspect_ratio,
-        count,
+function readBody(req: http.IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
+
+function send(res: http.ServerResponse, status: number, body: unknown): void {
+  const json = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(json),
+  });
+  res.end(json);
+}
+
+function sendError(res: http.ServerResponse, status: number, message: string): void {
+  send(res, status, { success: false, error: message });
+}
+
+async function parseJson(req: http.IncomingMessage): Promise<unknown> {
+  const buf = await readBody(req);
+  if (!buf.length) return {};
+  return JSON.parse(buf.toString("utf-8"));
+}
+
+// ─── Route handlers ───────────────────────────────────────────────────────────
+
+/**
+ * POST /generate
+ * Body: { prompt, image_paths?, aspect_ratio?, count? }
+ * Returns: { success, job_id, message }
+ */
+async function handleGenerate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { prompt, image_paths, aspect_ratio, count } = body;
+
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return sendError(res, 400, "prompt is required");
+  }
+
+  try {
+    const driver = await getDriver();
+    const jobId = await driver.submitGeneration({
+      prompt,
+      imagePaths: Array.isArray(image_paths) ? (image_paths as string[]) : undefined,
+      aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
+      count: typeof count === "number" ? count : 2,
+    });
+
+    send(res, 202, {
+      success: true,
+      job_id: jobId,
+      message: `Generation submitted as ${jobId}: "${prompt}"`,
+    });
+  } catch (error) {
+    activeDriver = null;
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
+ * POST /collect
+ * Body: { project_dir }
+ * Returns: { success, images: [{ project_path, archive_path }] }
+ */
+async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { project_dir } = body;
+
+  if (typeof project_dir !== "string" || !project_dir.trim()) {
+    return sendError(res, 400, "project_dir is required");
+  }
+
+  try {
+    const driver = await getDriver();
+
+    if (!driver.hasPendingJobs) {
+      return send(res, 200, {
+        success: true,
+        images: [],
+        message: "No pending generations to collect.",
       });
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              `Generation submitted as ${jobId}: "${prompt}" (${count ?? 2} variation(s))`,
-              "",
-              "Image is now generating in the background.",
-              "Submit more generate_image calls, or call collect_images to wait for results.",
-            ].join("\n"),
-          },
-        ],
-      };
-    } catch (error) {
-      activeDriver = null;
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text" as const, text: `Error submitting generation: ${message}` }],
-        isError: true,
-      };
     }
-  }
-);
 
-server.tool(
-  "collect_images",
-  "Wait for all pending image generations to complete, download and save them to the project's generated-images/ directory and archive. Call this after submitting one or more generate_image requests.",
-  {
-    project_dir: z
-      .string()
-      .describe("The project's root directory where generated-images/ will be created"),
-  },
-  async ({ project_dir }) => {
-    try {
-      const driver = await getDriver();
+    const images = await driver.collectAllImages();
+    const projectName = getProjectName();
+    const projectImagesDir = path.join(project_dir, "generated-images");
+    const saved: { project_path: string; archive_path: string }[] = [];
 
-      if (!driver.hasPendingJobs) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No pending generations to collect. Submit generate_image calls first.",
-            },
-          ],
-        };
-      }
+    for (const image of images) {
+      const smartName = `generation-${image.index}`;
+      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
 
-      const images = await driver.collectAllImages();
-      const projectName = getProjectName();
-      const projectImagesDir = path.join(project_dir, "generated-images");
-      const savedPaths: string[] = [];
+      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
 
-      for (const image of images) {
-        const smartName = `generation-${image.index}`;
-        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+      const archivePath = path.join(archiveDir, `${archiveName}.png`);
 
-        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
-
-        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-        const archivePath = path.join(archiveDir, `${archiveName}.png`);
-
-        await saveImage(image.buffer, projectPath);
-        await saveImage(image.buffer, archivePath);
-        savedPaths.push(projectPath);
-      }
-
-      const lines: string[] = [`Collected and saved ${images.length} image(s):`, ""];
-      for (let i = 0; i < savedPaths.length; i++) {
-        lines.push(`  ${i + 1}. ${savedPaths[i]}`);
-      }
-      lines.push("");
-      lines.push("Use the Read tool on each path to preview and identify which is which.");
-
-      return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
-      };
-    } catch (error) {
-      activeDriver = null;
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text" as const, text: `Error collecting images: ${message}` }],
-        isError: true,
-      };
+      await saveImage(image.buffer, projectPath);
+      await saveImage(image.buffer, archivePath);
+      saved.push({ project_path: projectPath, archive_path: archivePath });
     }
+
+    send(res, 200, { success: true, images: saved });
+  } catch (error) {
+    activeDriver = null;
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
   }
-);
+}
 
-server.tool(
-  "save_selected_images",
-  "Save user-selected images to the project directory and archive. Only saves the images the user chose to keep.",
-  {
-    temp_paths: z
-      .array(z.string())
-      .describe("Array of temp file paths for the selected images"),
-    smart_name: z
-      .string()
-      .describe("Short 2-3 word descriptive name for the files (e.g. 'watercolor-cat', 'neon-city')"),
-    project_dir: z
-      .string()
-      .describe("The project's root directory"),
-  },
-  async ({ temp_paths, smart_name, project_dir }) => {
-    try {
-      const projectName = getProjectName();
-      const savedPaths: { archive: string; project: string }[] = [];
+/**
+ * POST /save
+ * Body: { temp_paths, smart_name, project_dir }
+ * Returns: { success, saved: [{ project_path, archive_path }] }
+ */
+async function handleSave(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { temp_paths, smart_name, project_dir } = body;
 
-      const projectImagesDir = path.join(project_dir, "generated-images");
+  if (!Array.isArray(temp_paths) || temp_paths.length === 0) {
+    return sendError(res, 400, "temp_paths must be a non-empty array");
+  }
+  if (typeof smart_name !== "string" || !smart_name.trim()) {
+    return sendError(res, 400, "smart_name is required");
+  }
+  if (typeof project_dir !== "string" || !project_dir.trim()) {
+    return sendError(res, 400, "project_dir is required");
+  }
 
-      for (let i = 0; i < temp_paths.length; i++) {
-        const buffer = await readFile(temp_paths[i]);
-        const variationIndex = temp_paths.length > 1 ? i + 1 : undefined;
+  try {
+    const projectName = getProjectName();
+    const projectImagesDir = path.join(project_dir, "generated-images");
+    const safeName = slugify(smart_name);
+    const saved: { project_path: string; archive_path: string }[] = [];
 
-        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-        const { name: archiveName } = variationIndex !== undefined
-          ? { name: `${smart_name}-${variationIndex}` }
-          : nextAvailableName(archiveDir, smart_name);
+    for (let i = 0; i < temp_paths.length; i++) {
+      const buffer = await readFile(temp_paths[i] as string);
+      const variationIndex = temp_paths.length > 1 ? i + 1 : undefined;
 
-        const { name: projectFileName } = variationIndex !== undefined
-          ? { name: `${smart_name}-${variationIndex}` }
-          : nextAvailableName(projectImagesDir, smart_name);
+      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+      const archiveName = variationIndex !== undefined
+        ? `${safeName}-${variationIndex}`
+        : nextAvailableName(archiveDir, safeName).name;
+      const projectFileName = variationIndex !== undefined
+        ? `${safeName}-${variationIndex}`
+        : nextAvailableName(projectImagesDir, safeName).name;
 
-        const archivePath = path.join(archiveDir, `${archiveName}.png`);
-        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+      const archivePath = path.join(archiveDir, `${archiveName}.png`);
+      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
 
-        await saveImage(Buffer.from(buffer), archivePath);
-        await saveImage(Buffer.from(buffer), projectPath);
-        savedPaths.push({ archive: archivePath, project: projectPath });
-      }
-
-      await cleanTemp();
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              "Saved selected images:",
-              "",
-              ...savedPaths.map((p, i) => [
-                `  ${i + 1}. Project: ${p.project}`,
-                `     Archive: ${p.archive}`,
-              ].join("\n")),
-            ].join("\n"),
-          },
-        ],
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text" as const, text: `Error saving images: ${message}` }],
-        isError: true,
-      };
+      await saveImage(Buffer.from(buffer), archivePath);
+      await saveImage(Buffer.from(buffer), projectPath);
+      saved.push({ project_path: projectPath, archive_path: archivePath });
     }
+
+    await cleanTemp();
+    send(res, 200, { success: true, saved });
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
   }
-);
+}
 
-server.tool(
-  "edit_image",
-  "Edit one or more images using Google Flow. Upload reference images and describe the changes. Returns variations saved to temp for preview.",
-  {
-    image_paths: z
-      .array(z.string())
-      .describe("Array of file paths to the source image(s) to edit"),
-    prompt: z.string().describe("Description of what to change"),
-    aspect_ratio: z
-      .string()
-      .optional()
-      .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
-    project_dir: z
-      .string()
-      .describe("The project's root directory where generated-images/ will be created"),
-  },
-  async ({ image_paths, prompt, aspect_ratio, project_dir }) => {
-    try {
-      const driver = await getDriver();
+/**
+ * POST /edit
+ * Body: { image_paths, prompt, aspect_ratio?, project_dir }
+ * Returns: { success, images: [{ project_path, archive_path }] }
+ */
+async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { image_paths, prompt, aspect_ratio, project_dir } = body;
 
-      const images = await driver.edit({
-        imagePaths: image_paths,
-        prompt,
-        aspectRatio: aspect_ratio,
-      });
+  if (!Array.isArray(image_paths) || image_paths.length === 0) {
+    return sendError(res, 400, "image_paths must be a non-empty array");
+  }
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return sendError(res, 400, "prompt is required");
+  }
+  if (typeof project_dir !== "string" || !project_dir.trim()) {
+    return sendError(res, 400, "project_dir is required");
+  }
 
-      const smartName = slugify(prompt);
-      const projectName = getProjectName();
-      const projectImagesDir = path.join(project_dir, "generated-images");
-      const savedPaths: string[] = [];
+  try {
+    const driver = await getDriver();
+    const images = await driver.edit({
+      imagePaths: image_paths as string[],
+      prompt,
+      aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
+    });
 
-      for (const image of images) {
-        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
+    const smartName = slugify(prompt);
+    const projectName = getProjectName();
+    const projectImagesDir = path.join(project_dir, "generated-images");
+    const saved: { project_path: string; archive_path: string }[] = [];
 
-        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-        const archivePath = path.join(archiveDir, `${archiveName}.png`);
+    for (const image of images) {
+      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
 
-        await saveImage(image.buffer, projectPath);
-        await saveImage(image.buffer, archivePath);
-        savedPaths.push(projectPath);
-      }
+      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+      const archivePath = path.join(archiveDir, `${archiveName}.png`);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              `Edited image with prompt: "${prompt}"`,
-              "",
-              "Saved to:",
-              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
-              "",
-              "Use the Read tool on each path to show inline previews.",
-            ].join("\n"),
-          },
-        ],
-      };
-    } catch (error) {
-      activeDriver = null;
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text" as const, text: `Error editing image: ${message}` }],
-        isError: true,
-      };
+      await saveImage(image.buffer, projectPath);
+      await saveImage(image.buffer, archivePath);
+      saved.push({ project_path: projectPath, archive_path: archivePath });
     }
+
+    send(res, 200, { success: true, images: saved });
+  } catch (error) {
+    activeDriver = null;
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
   }
-);
+}
 
-server.tool(
-  "regen_image",
-  "Regenerate from an existing generated image in the current Flow session. Clicks on the image by index to open the edit view, then optionally applies a new prompt. Omit the prompt to regenerate a new variation with the original prompt. Use this to iterate on a previously generated image without re-uploading.",
-  {
-    image_index: z
-      .number()
-      .describe("1-based index of the generated image to regen from (e.g. 1 for first image)"),
-    prompt: z.string().optional().describe("New prompt to edit the image. Omit to regenerate a new variation with the original prompt."),
-    aspect_ratio: z
-      .string()
-      .optional()
-      .describe("Change aspect ratio: 1:1, 4:3, 3:4, 16:9, or 9:16"),
-    project_dir: z
-      .string()
-      .describe("The project's root directory where generated-images/ will be created"),
-  },
-  async ({ image_index, prompt, aspect_ratio, project_dir }) => {
-    try {
-      const driver = await getDriver();
+/**
+ * POST /regen
+ * Body: { image_index, prompt?, aspect_ratio?, project_dir }
+ * Returns: { success, images: [{ project_path, archive_path }] }
+ */
+async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { image_index, prompt, aspect_ratio, project_dir } = body;
 
-      const images = await driver.regen({
-        imageIndex: image_index,
-        prompt,
-        aspectRatio: aspect_ratio,
-      });
+  if (typeof image_index !== "number") {
+    return sendError(res, 400, "image_index must be a number");
+  }
+  if (typeof project_dir !== "string" || !project_dir.trim()) {
+    return sendError(res, 400, "project_dir is required");
+  }
 
-      const smartName = slugify(prompt ?? `regen-${image_index}`);
-      const projectName = getProjectName();
-      const projectImagesDir = path.join(project_dir, "generated-images");
-      const savedPaths: string[] = [];
+  try {
+    const driver = await getDriver();
+    const images = await driver.regen({
+      imageIndex: image_index,
+      prompt: typeof prompt === "string" ? prompt : undefined,
+      aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
+    });
 
-      for (const image of images) {
-        const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
-        const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
-        const { name: archiveName } = nextAvailableName(archiveDir, smartName);
+    const smartName = slugify(typeof prompt === "string" ? prompt : `regen-${image_index}`);
+    const projectName = getProjectName();
+    const projectImagesDir = path.join(project_dir, "generated-images");
+    const saved: { project_path: string; archive_path: string }[] = [];
 
-        const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
-        const archivePath = path.join(archiveDir, `${archiveName}.png`);
+    for (const image of images) {
+      const archiveDir = path.join(getArchiveBaseDir(), projectName ?? "General");
+      const { name: projectFileName } = nextAvailableName(projectImagesDir, smartName);
+      const { name: archiveName } = nextAvailableName(archiveDir, smartName);
 
-        await saveImage(image.buffer, projectPath);
-        await saveImage(image.buffer, archivePath);
-        savedPaths.push(projectPath);
-      }
+      const projectPath = path.join(projectImagesDir, `${projectFileName}.png`);
+      const archivePath = path.join(archiveDir, `${archiveName}.png`);
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: [
-              prompt
-                ? `Regenerated from image #${image_index} with prompt: "${prompt}"`
-                : `Regenerated a new variation from image #${image_index}`,
-              "",
-              "Saved to:",
-              ...savedPaths.map((p, i) => `  ${i + 1}. ${p}`),
-              "",
-              "Use the Read tool on each path to show inline previews.",
-            ].join("\n"),
-          },
-        ],
-      };
-    } catch (error) {
-      activeDriver = null;
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text" as const, text: `Error regenerating image: ${message}` }],
-        isError: true,
-      };
+      await saveImage(image.buffer, projectPath);
+      await saveImage(image.buffer, archivePath);
+      saved.push({ project_path: projectPath, archive_path: archivePath });
     }
-  }
-);
 
-async function main() {
+    send(res, 200, { success: true, images: saved });
+  } catch (error) {
+    activeDriver = null;
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
+  }
+}
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
+async function router(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const method = req.method ?? "";
+  const url = req.url ?? "";
+
+  // Health check
+  if (method === "GET" && url === "/health") {
+    return send(res, 200, { status: "ok" });
+  }
+
+  if (method !== "POST") {
+    return sendError(res, 405, "Method Not Allowed");
+  }
+
+  try {
+    if (url === "/generate") return await handleGenerate(req, res);
+    if (url === "/collect") return await handleCollect(req, res);
+    if (url === "/save") return await handleSave(req, res);
+    if (url === "/edit") return await handleEdit(req, res);
+    if (url === "/regen") return await handleRegen(req, res);
+
+    sendError(res, 404, `Unknown endpoint: ${url}`);
+  } catch (error) {
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
+  }
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
   const command = process.argv[2];
 
   if (command === "auth") {
@@ -378,9 +340,23 @@ async function main() {
     process.exit(0);
   }
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("[google-flow-mcp] Server started. Waiting for requests...");
+  const server = http.createServer((req, res) => {
+    router(req, res).catch((err) => {
+      console.error("[google-flow-mcp] Unhandled error:", err);
+      if (!res.headersSent) sendError(res, 500, "Internal server error");
+    });
+  });
+
+  server.listen(PORT, () => {
+    console.log(`[google-flow-mcp] REST API listening on http://localhost:${PORT}`);
+    console.log(`[google-flow-mcp] Endpoints:`);
+    console.log(`  GET  /health`);
+    console.log(`  POST /generate`);
+    console.log(`  POST /collect`);
+    console.log(`  POST /save`);
+    console.log(`  POST /edit`);
+    console.log(`  POST /regen`);
+  });
 }
 
 main().catch((error) => {
