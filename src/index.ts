@@ -19,6 +19,22 @@ const authManager = new AuthManager();
 // Reuse a single browser + driver across calls — no re-launching per request
 let activeDriver: FlowDriver | null = null;
 
+// ─── Request queue ────────────────────────────────────────────────────────────
+// Browser automation is single-threaded — serialize all operations to prevent
+// concurrent Playwright actions from corrupting each other.
+
+let queueTail: Promise<void> = Promise.resolve();
+
+function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  const result = queueTail.then(() => fn());
+  // Advance the tail — swallow errors so the queue keeps moving
+  queueTail = result.then(
+    () => {},
+    () => {}
+  );
+  return result;
+}
+
 async function getDriver(): Promise<FlowDriver> {
   if (activeDriver) return activeDriver;
 
@@ -80,12 +96,12 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
 
   try {
     const driver = await getDriver();
-    const jobId = await driver.submitGeneration({
+    const jobId = await enqueue(() => driver.submitGeneration({
       prompt,
       imagePaths: Array.isArray(image_paths) ? (image_paths as string[]) : undefined,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
       count: typeof count === "number" ? count : 2,
-    });
+    }));
 
     send(res, 202, {
       success: true,
@@ -122,7 +138,7 @@ async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse
       });
     }
 
-    const images = await driver.collectAllImages();
+    const images = await enqueue(() => driver.collectAllImages());
     const projectName = getProjectName();
     const projectImagesDir = path.join(project_dir, "generated-images");
     const saved: { project_path: string; archive_path: string }[] = [];
@@ -222,11 +238,11 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
 
   try {
     const driver = await getDriver();
-    const images = await driver.edit({
+    const images = await enqueue(() => driver.edit({
       imagePaths: image_paths as string[],
       prompt,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
-    });
+    }));
 
     const smartName = slugify(prompt);
     const projectName = getProjectName();
@@ -271,11 +287,11 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
 
   try {
     const driver = await getDriver();
-    const images = await driver.regen({
+    const images = await enqueue(() => driver.regen({
       imageIndex: image_index,
       prompt: typeof prompt === "string" ? prompt : undefined,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
-    });
+    }));
 
     const smartName = slugify(typeof prompt === "string" ? prompt : `regen-${image_index}`);
     const projectName = getProjectName();
