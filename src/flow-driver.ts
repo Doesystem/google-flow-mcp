@@ -196,9 +196,13 @@ export class FlowDriver {
   private async typePrompt(prompt: string): Promise<void> {
     const editor = this.page!.locator(PROMPT_SELECTOR);
     await editor.click();
+    // Clear existing content
     await this.page!.keyboard.press("Control+a");
     await this.page!.keyboard.press("Backspace");
-    await this.page!.keyboard.type(prompt, { delay: 10 });
+    await this.page!.waitForTimeout(300);
+    // Type using fill() which triggers proper input events on Slate editors
+    await editor.fill(prompt);
+    await this.page!.waitForTimeout(300);
     const typed = await editor.textContent();
     console.error(`[google-flow-mcp] Prompt field content after typing: "${typed?.slice(0, 80)}"`);
   }
@@ -257,14 +261,18 @@ export class FlowDriver {
       console.error("[google-flow-mcp] Could not re-focus prompt editor before Create");
     }
 
-    // The submit button has text "arrow_forwardCreate" (material icon + text)
+    // Try submitting via Enter key first (works better with Slate editors)
+    console.error("[google-flow-mcp] Submitting via Enter key");
+    await this.page!.keyboard.press("Enter");
+    await this.page!.waitForTimeout(1_000);
+
+    // Check if a loading/generating state appeared — if not, fall back to button click
     const createBtn = this.page!.locator('button:has-text("Create")').last();
     const btnCount = await createBtn.count();
     console.error(`[google-flow-mcp] Found ${btnCount} button(s) matching "Create"`);
     try {
       await createBtn.click({ timeout: 5_000 });
       console.error("[google-flow-mcp] Clicked Create button");
-      // Wait a moment to let Flow start processing
       await this.page!.waitForTimeout(2_000);
     } catch {
       console.error("[google-flow-mcp] Could not click Create button");
