@@ -182,8 +182,14 @@ export class FlowDriver {
   }
 
   private async closeSettingsPanel(): Promise<void> {
-    // Press Escape to dismiss the Radix popover
-    await this.page!.keyboard.press("Escape");
+    // Click the prompt editor to dismiss the popover and restore focus there
+    const editor = this.page!.locator(PROMPT_SELECTOR);
+    try {
+      await editor.click({ timeout: 3_000 });
+    } catch {
+      // Fallback to Escape
+      await this.page!.keyboard.press("Escape");
+    }
     await this.page!.waitForTimeout(500);
   }
 
@@ -242,6 +248,15 @@ export class FlowDriver {
   }
 
   private async clickCreate(): Promise<void> {
+    // Re-focus the prompt editor first to ensure the form is active
+    const editor = this.page!.locator(PROMPT_SELECTOR);
+    try {
+      await editor.click({ timeout: 3_000 });
+      await this.page!.waitForTimeout(300);
+    } catch {
+      console.error("[google-flow-mcp] Could not re-focus prompt editor before Create");
+    }
+
     // The submit button has text "arrow_forwardCreate" (material icon + text)
     const createBtn = this.page!.locator('button:has-text("Create")').last();
     const btnCount = await createBtn.count();
@@ -249,6 +264,8 @@ export class FlowDriver {
     try {
       await createBtn.click({ timeout: 5_000 });
       console.error("[google-flow-mcp] Clicked Create button");
+      // Wait a moment to let Flow start processing
+      await this.page!.waitForTimeout(2_000);
     } catch {
       console.error("[google-flow-mcp] Could not click Create button");
     }
