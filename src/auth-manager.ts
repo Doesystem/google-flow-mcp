@@ -78,20 +78,20 @@ export class AuthManager {
 
     this.browser = await chromium.launch({
       channel: "chrome",
-      headless: true,
+      headless: false,
       ignoreDefaultArgs: AUTOMATION_FLAGS,
       args: [
         "--disable-blink-features=AutomationControlled",
-        // These flags help headless Chrome behave closer to headful
-        // and allow keyboard/input events to work properly with React/Slate editors
         "--window-size=1280,900",
         "--force-device-scale-factor=1",
+        "--window-position=-32000,-32000",  // hide window off-screen on Windows
       ],
     });
 
     this.context = await this.browser!.newContext({
       storageState: state,
       viewport: { width: 1280, height: 900 },
+      permissions: ["clipboard-read", "clipboard-write"],
     });
 
     await this.context.addInitScript(() => {
