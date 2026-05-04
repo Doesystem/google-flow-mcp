@@ -263,10 +263,10 @@ export class FlowDriver {
     }
     console.error(`[google-flow-mcp] Visible [role=tab] elements: ${tabTexts.join(", ") || "(none)"}`);
 
-    // Count buttons are Radix tabs with role="tab" and text "x1"-"x4"
-    const countButton = this.page!.locator(`button[role="tab"]:text-is("x${count}")`);
+    // Count buttons are tabs with text "1x"-"4x"
+    const countButton = this.page!.locator(`button[role="tab"]:text-is("${count}x")`);
     const btnCount = await countButton.count();
-    console.error(`[google-flow-mcp] Found ${btnCount} tab button(s) matching "x${count}"`);
+    console.error(`[google-flow-mcp] Found ${btnCount} tab button(s) matching "${count}x"`);
     try {
       await countButton.click({ timeout: 5_000 });
       console.error(`[google-flow-mcp] Set output count to ${count}`);
