@@ -11,6 +11,9 @@ import {
   buildJobImagePath,
   saveImage,
   getOutputBase,
+  saveJobRecord,
+  getJobRecord,
+  getLastJobRecord,
 } from "./file-manager.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
@@ -92,7 +95,7 @@ async function downloadToTemp(url: string): Promise<string> {
 /**
  * POST /generate
  * Body: { prompt, image_paths?, image_urls?, aspect_ratio?, count? }
- * Returns: { success, job_id }
+ * Returns: { success, job_id, images: [{ index, path }] }
  */
 async function handleGenerate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
@@ -113,15 +116,25 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
       ...downloadedPaths,
     ];
 
+    const jobId = generateJobId();
     const driver = await getDriver();
-    const jobId = await enqueue(() => driver.submitGeneration({
+    const images = await enqueue(() => driver.generate({
       prompt,
       imagePaths: allPaths.length > 0 ? allPaths : undefined,
       aspectRatio: typeof aspect_ratio === "string" ? aspect_ratio : undefined,
       count: typeof count === "number" ? count : 2,
+      jobId,
     }));
 
-    send(res, 202, { success: true, job_id: jobId });
+    const saved: { index: number; path: string }[] = [];
+    for (const image of images) {
+      const filePath = buildJobImagePath(jobId, image.index);
+      await saveImage(image.buffer, filePath);
+      saved.push({ index: image.index, path: filePath });
+    }
+
+    await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
     sendError(res, 500, error instanceof Error ? error.message : String(error));
@@ -130,44 +143,29 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
 
 /**
  * POST /collect
- * Body: {} (empty)
- * Returns: { success, jobs: [{ job_id, images: [{ index, path }] }] }
+ * Body: { job_id? }
+ * - no job_id → return the most recent job
+ * - with job_id → return that specific job
+ * Returns: { success, job_id, images: [{ index, path }] }
  */
 async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-  try {
-    const driver = await getDriver();
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { job_id } = body;
 
-    if (!driver.hasPendingJobs) {
-      return send(res, 200, { success: true, jobs: [], message: "No pending generations." });
+  if (typeof job_id === "string") {
+    const result = await getJobRecord(job_id);
+    if (!result) {
+      return sendError(res, 404, `Job "${job_id}" not found`);
     }
-
-    const { images, jobIds } = await enqueue(() => driver.collectAllImages());
-    const outputBase = getOutputBase();
-
-    // Group images by job_id
-    const jobMap = new Map<string, { index: number; path: string }[]>();
-    for (const jobId of jobIds) {
-      jobMap.set(jobId, []);
-    }
-
-    for (const image of images) {
-      const jobId = image.jobId;
-      const filePath = buildJobImagePath(jobId, image.index);
-      await saveImage(image.buffer, filePath);
-      jobMap.get(jobId)?.push({ index: image.index, path: filePath });
-    }
-
-    const jobs = Array.from(jobMap.entries()).map(([job_id, imgs]) => ({
-      job_id,
-      images: imgs,
-    }));
-
-    console.error(`[google-flow-mcp] Saved images to: ${outputBase}`);
-    send(res, 200, { success: true, jobs });
-  } catch (error) {
-    activeDriver = null;
-    sendError(res, 500, error instanceof Error ? error.message : String(error));
+    return send(res, 200, { success: true, job_id: result.job_id, images: result.images });
   }
+
+  // No job_id — return the most recent job
+  const result = await getLastJobRecord();
+  if (!result) {
+    return send(res, 200, { success: true, job_id: null, images: [], message: "No jobs completed yet." });
+  }
+  send(res, 200, { success: true, job_id: result.job_id, images: result.images });
 }
 
 /**
@@ -216,6 +214,7 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
       saved.push({ index: image.index, path: filePath });
     }
 
+    await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
     send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
@@ -253,6 +252,7 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
       saved.push({ index: image.index, path: filePath });
     }
 
+    await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
     send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;

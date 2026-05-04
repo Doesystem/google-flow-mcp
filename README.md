@@ -71,6 +71,7 @@ All images are saved to:
 
 ```
 ~/GoogleFlow/
+  jobs.json             ← job history (persists across restarts)
   job-20260505-143022/
     1.png
     2.png
@@ -78,7 +79,7 @@ All images are saved to:
     1.png
 ```
 
-Each job gets its own folder named by timestamp. No configuration needed.
+Each job gets its own folder named by timestamp. `jobs.json` keeps a record of all completed jobs so `/collect` works even after a server restart.
 
 ---
 
@@ -126,12 +127,16 @@ curl -X POST http://localhost:3000/generate \
   -d '{"prompt": "a cat in watercolor style", "count": 2}'
 ```
 
-**Response `202`**
+**Response `200`**
 
 ```json
 {
   "success": true,
-  "job_id": "job-20260505-143022"
+  "job_id": "job-20260505-143022",
+  "images": [
+    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png" },
+    { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png" }
+  ]
 }
 ```
 
@@ -139,13 +144,26 @@ curl -X POST http://localhost:3000/generate \
 
 ### `POST /collect`
 
-Wait for all pending generations to finish, then download and save images.  
-No body required.
+Lookup a completed job. Works across server restarts — job history is persisted in `~/GoogleFlow/jobs.json`.
 
-**Example**
+**Body**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `job_id` | string | — | Job ID to look up — omit to get the most recent job |
+
+**Example — get most recent job**
 
 ```bash
 curl -X POST http://localhost:3000/collect
+```
+
+**Example — get specific job**
+
+```bash
+curl -X POST http://localhost:3000/collect \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "job-20260505-143022"}'
 ```
 
 **Response `200`**
@@ -153,14 +171,10 @@ curl -X POST http://localhost:3000/collect
 ```json
 {
   "success": true,
-  "jobs": [
-    {
-      "job_id": "job-20260505-143022",
-      "images": [
-        { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png" },
-        { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png" }
-      ]
-    }
+  "job_id": "job-20260505-143022",
+  "images": [
+    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png" },
+    { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png" }
   ]
 }
 ```
@@ -172,7 +186,6 @@ curl -X POST http://localhost:3000/collect
 Upload one or more images and apply an edit prompt. Saves results immediately — no separate `/collect` needed.
 
 **Body**
-
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `image_paths` | string[] | — | Local file paths of images to edit |
@@ -244,11 +257,10 @@ curl -X POST http://localhost:3000/regen \
 ## Typical Workflow
 
 ```
-1. POST /generate   → get job_id (non-blocking, Flow generates in background)
-2. POST /generate   → submit more jobs while first is generating (optional)
-3. POST /collect    → wait for all jobs, get saved image paths
-4. POST /regen      → iterate on a result you like
-5. POST /edit       → apply edits with a new prompt
+1. POST /generate   → รอ Flow เสร็จ → return { job_id, images }
+2. POST /edit       → แก้รูปด้วย prompt ใหม่ → return { job_id, images }
+3. POST /regen      → สร้าง variation ใหม่ → return { job_id, images }
+4. POST /collect    → ดูผลย้อนหลังได้ตลอด (ไม่ต้อง generate ใหม่)
 ```
 
 ---

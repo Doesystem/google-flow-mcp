@@ -1,11 +1,12 @@
 import crypto from "crypto";
 import fs from "fs";
-import { mkdir, writeFile, rm } from "fs/promises";
+import { mkdir, writeFile, readFile, rm } from "fs/promises";
 import path from "path";
 import os from "os";
 
 export const OUTPUT_BASE = path.join(os.homedir(), "GoogleFlow");
 const TEMP_DIR = path.join(os.tmpdir(), "google-flow");
+const JOBS_FILE = path.join(OUTPUT_BASE, "jobs.json");
 
 export function getOutputBase(): string {
   return OUTPUT_BASE;
@@ -52,4 +53,49 @@ export function slugify(text: string): string {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 50) || "untitled";
+}
+
+// ─── Job store (persisted to ~/GoogleFlow/jobs.json) ─────────────────────────
+
+export interface JobRecord {
+  job_id: string;
+  images: { index: number; path: string }[];
+  completed_at: number;
+}
+
+interface JobsFile {
+  last_job_id: string | null;
+  jobs: Record<string, JobRecord>;
+}
+
+async function readJobsFile(): Promise<JobsFile> {
+  try {
+    const raw = await readFile(JOBS_FILE, "utf-8");
+    return JSON.parse(raw) as JobsFile;
+  } catch {
+    return { last_job_id: null, jobs: {} };
+  }
+}
+
+async function writeJobsFile(data: JobsFile): Promise<void> {
+  await mkdir(OUTPUT_BASE, { recursive: true });
+  await writeFile(JOBS_FILE, JSON.stringify(data, null, 2));
+}
+
+export async function saveJobRecord(record: JobRecord): Promise<void> {
+  const data = await readJobsFile();
+  data.jobs[record.job_id] = record;
+  data.last_job_id = record.job_id;
+  await writeJobsFile(data);
+}
+
+export async function getJobRecord(jobId: string): Promise<JobRecord | null> {
+  const data = await readJobsFile();
+  return data.jobs[jobId] ?? null;
+}
+
+export async function getLastJobRecord(): Promise<JobRecord | null> {
+  const data = await readJobsFile();
+  if (!data.last_job_id) return null;
+  return data.jobs[data.last_job_id] ?? null;
 }
