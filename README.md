@@ -88,10 +88,11 @@ Each job gets its own folder named by timestamp. `jobs.json` keeps a record of a
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check |
-| `POST` | `/generate` | Submit an image generation job (non-blocking) |
-| `POST` | `/collect` | Wait for all pending jobs and save results |
-| `POST` | `/edit` | Edit images with a new prompt |
-| `POST` | `/regen` | Regenerate a variation from an existing image |
+| `GET` | `/img/collect/{jobId}/{index}` | Serve a generated image (for browser / n8n download) |
+| `POST` | `/img/generate` | Generate images from a prompt |
+| `POST` | `/collect` | Lookup a completed job |
+| `POST` | `/img/edit` | Edit images with a new prompt |
+| `POST` | `/img/regen` | Regenerate a variation from an existing image |
 
 ---
 
@@ -105,9 +106,23 @@ Each job gets its own folder named by timestamp. `jobs.json` keeps a record of a
 
 ---
 
-### `POST /generate`
+### `GET /img/{jobId}/{index}`
 
-Submit a generation job. Returns immediately with a `job_id` — call `/collect` to wait for results.
+Serve a generated image directly — opens in browser or can be downloaded by n8n.
+
+```
+GET http://localhost:3000/img/collect/job-20260505-143022/1
+```
+
+Returns the PNG image with `Content-Type: image/png`. Cached permanently (immutable).
+
+Returns `404` if the job or image index does not exist.
+
+---
+
+### `POST /img/generate`
+
+Generate images from a prompt. Blocks until Flow finishes, then saves and returns results.
 
 **Body**
 
@@ -122,7 +137,7 @@ Submit a generation job. Returns immediately with a `job_id` — call `/collect`
 **Example**
 
 ```bash
-curl -X POST http://localhost:3000/generate \
+curl -X POST http://localhost:3000/img/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "a cat in watercolor style", "count": 2}'
 ```
@@ -134,8 +149,8 @@ curl -X POST http://localhost:3000/generate \
   "success": true,
   "job_id": "job-20260505-143022",
   "images": [
-    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png" },
-    { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png" }
+    { "index": 1, "path": "/Users/me/GoogleFlow/job-20260505-143022/1.png", "url": "/img/collect/job-20260505-143022/1" },
+    { "index": 2, "path": "/Users/me/GoogleFlow/job-20260505-143022/2.png", "url": "/img/collect/job-20260505-143022/2" }
   ]
 }
 ```
@@ -181,7 +196,7 @@ curl -X POST http://localhost:3000/collect \
 
 ---
 
-### `POST /edit`
+### `POST /img/edit`
 
 Upload one or more images and apply an edit prompt. Saves results immediately — no separate `/collect` needed.
 
@@ -198,7 +213,7 @@ At least one of `image_paths` or `image_urls` is required.
 **Example**
 
 ```bash
-curl -X POST http://localhost:3000/edit \
+curl -X POST http://localhost:3000/img/edit \
   -H "Content-Type: application/json" \
   -d '{
     "image_urls": ["https://example.com/photo.jpg"],
@@ -220,7 +235,7 @@ curl -X POST http://localhost:3000/edit \
 
 ---
 
-### `POST /regen`
+### `POST /img/regen`
 
 Regenerate a variation from an image already generated in the current session. Optionally apply a new prompt.
 
@@ -235,7 +250,7 @@ Regenerate a variation from an image already generated in the current session. O
 **Example**
 
 ```bash
-curl -X POST http://localhost:3000/regen \
+curl -X POST http://localhost:3000/img/regen \
   -H "Content-Type: application/json" \
   -d '{"image_index": 1, "prompt": "same but at night"}'
 ```
@@ -257,10 +272,11 @@ curl -X POST http://localhost:3000/regen \
 ## Typical Workflow
 
 ```
-1. POST /generate   → รอ Flow เสร็จ → return { job_id, images }
-2. POST /edit       → แก้รูปด้วย prompt ใหม่ → return { job_id, images }
-3. POST /regen      → สร้าง variation ใหม่ → return { job_id, images }
-4. POST /collect    → ดูผลย้อนหลังได้ตลอด (ไม่ต้อง generate ใหม่)
+1. POST /img/generate              → รอ Flow เสร็จ → return { job_id, images: [{ url, path }] }
+2. GET  /img/collect/{jobId}/1     → เปิดดูรูปใน browser หรือให้ n8n download
+3. POST /img/edit                  → แก้รูปด้วย prompt ใหม่
+4. POST /img/regen                 → สร้าง variation ใหม่
+5. POST /collect                   → ดูผลย้อนหลังได้ตลอด (ไม่ต้อง generate ใหม่)
 ```
 
 ---

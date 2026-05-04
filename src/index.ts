@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import http from "http";
 import path from "path";
-import { mkdir, writeFile } from "fs/promises";
+import { mkdir, writeFile, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import crypto from "crypto";
 import { AuthManager } from "./auth-manager.js";
@@ -90,12 +90,16 @@ async function downloadToTemp(url: string): Promise<string> {
   return filePath;
 }
 
+function imageUrl(jobId: string, index: number): string {
+  return `/img/collect/${jobId}/${index}`;
+}
+
 // ─── Route handlers ───────────────────────────────────────────────────────────
 
 /**
- * POST /generate
+ * POST /img/generate
  * Body: { prompt, image_paths?, image_urls?, aspect_ratio?, count? }
- * Returns: { success, job_id, images: [{ index, path }] }
+ * Returns: { success, job_id, images: [{ index, path, url }] }
  */
 async function handleGenerate(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
@@ -106,7 +110,6 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
   }
 
   try {
-    // Download URL images before entering the browser queue
     const downloadedPaths: string[] = Array.isArray(image_urls)
       ? await Promise.all((image_urls as string[]).map(downloadToTemp))
       : [];
@@ -126,11 +129,11 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
       jobId,
     }));
 
-    const saved: { index: number; path: string }[] = [];
+    const saved: { index: number; path: string; url: string }[] = [];
     for (const image of images) {
       const filePath = buildJobImagePath(jobId, image.index);
       await saveImage(image.buffer, filePath);
-      saved.push({ index: image.index, path: filePath });
+      saved.push({ index: image.index, path: filePath, url: imageUrl(jobId, image.index) });
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
@@ -146,7 +149,7 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
  * Body: { job_id? }
  * - no job_id → return the most recent job
  * - with job_id → return that specific job
- * Returns: { success, job_id, images: [{ index, path }] }
+ * Returns: { success, job_id, images: [{ index, path, url }] }
  */
 async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
@@ -160,7 +163,6 @@ async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse
     return send(res, 200, { success: true, job_id: result.job_id, images: result.images });
   }
 
-  // No job_id — return the most recent job
   const result = await getLastJobRecord();
   if (!result) {
     return send(res, 200, { success: true, job_id: null, images: [], message: "No jobs completed yet." });
@@ -169,10 +171,10 @@ async function handleCollect(req: http.IncomingMessage, res: http.ServerResponse
 }
 
 /**
- * POST /edit
+ * POST /img/edit
  * Body: { image_paths?, image_urls?, prompt, aspect_ratio? }
  * At least one of image_paths or image_urls is required.
- * Returns: { success, job_id, images: [{ index, path }] }
+ * Returns: { success, job_id, images: [{ index, path, url }] }
  */
 async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
@@ -207,11 +209,11 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
       jobId,
     }));
 
-    const saved: { index: number; path: string }[] = [];
+    const saved: { index: number; path: string; url: string }[] = [];
     for (const image of images) {
       const filePath = buildJobImagePath(jobId, image.index);
       await saveImage(image.buffer, filePath);
-      saved.push({ index: image.index, path: filePath });
+      saved.push({ index: image.index, path: filePath, url: imageUrl(jobId, image.index) });
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
@@ -223,9 +225,9 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
 }
 
 /**
- * POST /regen
+ * POST /img/regen
  * Body: { image_index, prompt?, aspect_ratio? }
- * Returns: { success, job_id, images: [{ index, path }] }
+ * Returns: { success, job_id, images: [{ index, path, url }] }
  */
 async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
@@ -245,11 +247,11 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
       jobId,
     }));
 
-    const saved: { index: number; path: string }[] = [];
+    const saved: { index: number; path: string; url: string }[] = [];
     for (const image of images) {
       const filePath = buildJobImagePath(jobId, image.index);
       await saveImage(image.buffer, filePath);
-      saved.push({ index: image.index, path: filePath });
+      saved.push({ index: image.index, path: filePath, url: imageUrl(jobId, image.index) });
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
@@ -262,12 +264,38 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
+// Match GET /img/collect/{jobId}/{index}
+const IMG_ROUTE = /^\/img\/collect\/(job-[\w-]+)\/(\d+)$/;
+
 async function router(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const method = req.method ?? "";
   const url = req.url ?? "";
 
+  // Health check
   if (method === "GET" && url === "/health") {
     return send(res, 200, { status: "ok", output_dir: getOutputBase() });
+  }
+
+  // Image serving — GET /img/collect/{jobId}/{index}
+  if (method === "GET") {
+    const match = IMG_ROUTE.exec(url);
+    if (match) {
+      const [, jobId, indexStr] = match;
+      const filePath = buildJobImagePath(jobId, parseInt(indexStr, 10));
+      try {
+        const buffer = await readFile(filePath);
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Content-Length": buffer.length,
+          "Cache-Control": "public, max-age=31536000, immutable",
+        });
+        res.end(buffer);
+      } catch {
+        sendError(res, 404, `Image not found: ${jobId}/${indexStr}`);
+      }
+      return;
+    }
+    return sendError(res, 404, `Not found: ${url}`);
   }
 
   if (method !== "POST") {
@@ -275,10 +303,10 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   try {
-    if (url === "/generate") return await handleGenerate(req, res);
-    if (url === "/collect") return await handleCollect(req, res);
-    if (url === "/edit")     return await handleEdit(req, res);
-    if (url === "/regen")    return await handleRegen(req, res);
+    if (url === "/img/generate") return await handleGenerate(req, res);
+    if (url === "/collect")      return await handleCollect(req, res);
+    if (url === "/img/edit")     return await handleEdit(req, res);
+    if (url === "/img/regen")    return await handleRegen(req, res);
 
     sendError(res, 404, `Unknown endpoint: ${url}`);
   } catch (error) {
@@ -308,10 +336,11 @@ async function main(): Promise<void> {
     console.log(`[google-flow-mcp] Output directory: ${getOutputBase()}`);
     console.log(`[google-flow-mcp] Endpoints:`);
     console.log(`  GET  /health`);
-    console.log(`  POST /generate`);
+    console.log(`  GET  /img/collect/{jobId}/{index}  (serve image)`);
+    console.log(`  POST /img/generate`);
     console.log(`  POST /collect`);
-    console.log(`  POST /edit`);
-    console.log(`  POST /regen`);
+    console.log(`  POST /img/edit`);
+    console.log(`  POST /img/regen`);
   });
 }
 
