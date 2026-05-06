@@ -94,6 +94,10 @@ export class FlowDriver {
   async edit(options: EditOptions & { jobId: string }): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
+    // Navigate back to the main canvas before uploading
+    // in case we're still inside an edit view from a previous call
+    await this.returnToCanvas();
+
     await this.uploadImages(options.imagePaths);
 
     await this.openSettingsPanel();
@@ -153,6 +157,20 @@ export class FlowDriver {
     }
     await this.clickCreate();
     return this.waitAndDownloadNewImages(1, existingSrcs, options.jobId);
+  }
+
+  private async returnToCanvas(): Promise<void> {
+    const currentUrl = this.page!.url();
+    // Edit view URL pattern: /project/{id}/edit/{editId}
+    // Canvas URL pattern:    /project/{id}
+    if (!currentUrl.includes("/edit/")) return;
+
+    const canvasUrl = currentUrl.replace(/\/edit\/[^/]+$/, "");
+    console.error(`[google-flow-mcp] Returning to canvas: ${canvasUrl}`);
+    await this.page!.goto(canvasUrl, { waitUntil: "networkidle" });
+    await this.page!.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
+    await this.page!.waitForTimeout(500);
+    console.error("[google-flow-mcp] Back on main canvas");
   }
 
   private async openSettingsPanel(): Promise<void> {
