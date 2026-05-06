@@ -100,11 +100,7 @@ export class FlowDriver {
     // Always start fresh — navigate to Flow dashboard and create a new project
     await this.resetToNewProject();
 
-    // Upload reference images if provided
-    if (options.imagePaths && options.imagePaths.length > 0) {
-      await this.uploadImages(options.imagePaths);
-    }
-
+    // Configure settings first (before any uploads)
     await this.openSettingsPanel();
     await this.selectVideoMode();
     await this.selectVideoFrames();
@@ -113,7 +109,7 @@ export class FlowDriver {
     await this.selectVeoModel();
     await this.closeSettingsPanel();
 
-    // Upload video_start and video_end reference frames if provided
+    // Upload start/end frames after settings are configured
     if (options.videoStartPath || options.videoEndPath) {
       await this.uploadVideoFrames(options.videoStartPath, options.videoEndPath);
     }
@@ -213,28 +209,102 @@ export class FlowDriver {
   }
 
   private async uploadVideoFrames(startPath?: string, endPath?: string): Promise<void> {
-    // Flow video Frames mode has "First frame" and "Last frame" upload slots
-    // We look for file inputs in order: first = start frame, second = end frame
-    const fileInputs = await this.page!.locator('input[type="file"]').all();
-    console.error(`[google-flow-mcp] Found ${fileInputs.length} file input(s) for video frames`);
+    // Helper: upload one image and wait for it to appear in media library
+    const uploadAndWait = async (filePath: string, label: string): Promise<string | null> => {
+      // Snapshot existing srcs before upload
+      const beforeImgs = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+      const beforeSrcs = new Set<string>();
+      for (const img of beforeImgs) {
+        const src = await img.getAttribute("src");
+        if (src) beforeSrcs.add(src);
+      }
 
-    if (startPath && fileInputs.length >= 1) {
+      const addBtn = this.page!.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
       try {
-        await fileInputs[0].setInputFiles(startPath);
-        console.error(`[google-flow-mcp] Uploaded video start frame: ${startPath}`);
-        await this.page!.waitForTimeout(2_000);
+        await addBtn.click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(500);
+      } catch { /* fall through */ }
+
+      const fileInput = this.page!.locator('input[type="file"]').first();
+      try {
+        await fileInput.setInputFiles(filePath);
+        console.error(`[google-flow-mcp] Uploading ${label}...`);
       } catch {
-        console.error("[google-flow-mcp] Could not upload video start frame");
+        console.error(`[google-flow-mcp] Could not upload ${label}`);
+        return null;
+      }
+
+      // Wait for new media.getMediaUrlRedirect src to appear (same as /img/edit)
+      const deadline = Date.now() + 30_000;
+      let uploadedSrc: string | null = null;
+      while (!uploadedSrc && Date.now() < deadline) {
+        await this.page!.waitForTimeout(1_000);
+        const allImgs = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+        for (const img of allImgs) {
+          const src = await img.getAttribute("src");
+          if (src && !beforeSrcs.has(src)) {
+            uploadedSrc = src;
+            break;
+          }
+        }
+      }
+
+      if (uploadedSrc) {
+        console.error(`[google-flow-mcp] ${label} upload complete`);
+        await this.page!.waitForTimeout(2_000); // let Flow finish processing
+      } else {
+        console.error(`[google-flow-mcp] ${label} upload timed out`);
+      }
+      return uploadedSrc;
+    };
+
+    // Upload both images first
+    const startSrc = startPath ? await uploadAndWait(startPath, "start frame") : null;
+    const endSrc   = endPath   ? await uploadAndWait(endPath,   "end frame")   : null;
+
+    // Wait for Start/End buttons to appear
+    console.error("[google-flow-mcp] Waiting for Start/End frame buttons...");
+    try {
+      await this.page!.waitForSelector('div[type="button"]:has-text("Start")', { timeout: 10_000 });
+    } catch {
+      console.error("[google-flow-mcp] Start/End buttons not found — skipping frame selection");
+      return;
+    }
+
+    // Click "Start" → dialog opens → click the row div (sc-1dc6bdcb-15) of the start image
+    if (startSrc) {
+      console.error("[google-flow-mcp] Clicking 'Start' to select start frame...");
+      try {
+        await this.page!.locator('div[type="button"]:has-text("Start")').click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(1_000);
+        await this.page!.waitForSelector('[data-testid="virtuoso-item-list"]', { timeout: 10_000 });
+
+        const nameId = startSrc.split("name=")[1];
+        // Target the row div (parent is div, not button/a) that contains the start image
+        const row = this.page!.locator(`[data-testid="virtuoso-item-list"] div[class*="sc-1dc6bdcb-15"]:has(img[src*="${nameId}"])`);
+        await row.click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(500);
+        console.error("[google-flow-mcp] Selected start frame");
+      } catch {
+        console.error("[google-flow-mcp] Could not select start frame");
       }
     }
 
-    if (endPath && fileInputs.length >= 2) {
+    // Click "End" → dialog opens → click the row div of the end image
+    if (endSrc) {
+      console.error("[google-flow-mcp] Clicking 'End' to select end frame...");
       try {
-        await fileInputs[1].setInputFiles(endPath);
-        console.error(`[google-flow-mcp] Uploaded video end frame: ${endPath}`);
-        await this.page!.waitForTimeout(2_000);
+        await this.page!.locator('div[type="button"]:has-text("End")').click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(1_000);
+        await this.page!.waitForSelector('[data-testid="virtuoso-item-list"]', { timeout: 10_000 });
+
+        const nameId = endSrc.split("name=")[1];
+        const row = this.page!.locator(`[data-testid="virtuoso-item-list"] div[class*="sc-1dc6bdcb-15"]:has(img[src*="${nameId}"])`);
+        await row.click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(500);
+        console.error("[google-flow-mcp] Selected end frame");
       } catch {
-        console.error("[google-flow-mcp] Could not upload video end frame");
+        console.error("[google-flow-mcp] Could not select end frame");
       }
     }
   }

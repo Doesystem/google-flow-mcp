@@ -169,34 +169,93 @@ await step("Close settings panel (Escape then click prompt editor)", async () =>
 
 // ── 10. Upload video start/end frames (if provided) ──────────────────────────
 if (VIDEO_START_URL || VIDEO_END_URL) {
-  await step("Upload video start/end frames", async () => {
-    const fileInputs = await page.locator('input[type="file"]').all();
-    log(`  Found ${fileInputs.length} file input(s)`);
+  await step("Upload and select video start/end frames", async () => {
 
-    if (VIDEO_START_URL && fileInputs.length >= 1) {
-      log(`  Downloading start frame: ${VIDEO_START_URL}`);
-      const res = await fetch(VIDEO_START_URL);
-      if (!res.ok) throw new Error(`Failed to download start frame: ${res.status}`);
+    // Helper: upload one image and wait for media.getMediaUrlRedirect src to appear
+    const uploadAndWait = async (url, label) => {
+      log(`  Downloading ${label}: ${url}`);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed to download ${label}: ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
-      const ext = VIDEO_START_URL.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
-      const tmpPath = path.join(os.tmpdir(), `video-start-${Date.now()}.${ext}`);
+      const ext = url.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
+      const tmpPath = path.join(os.tmpdir(), `video-frame-${Date.now()}.${ext}`);
       await writeFile(tmpPath, buf);
-      await fileInputs[0].setInputFiles(tmpPath);
-      log(`  Uploaded start frame: ${tmpPath}`);
-      await page.waitForTimeout(2_000);
+
+      // Snapshot existing srcs
+      const beforeImgs = await page.locator('img[src*="media.getMediaUrlRedirect"]').all();
+      const beforeSrcs = new Set();
+      for (const img of beforeImgs) {
+        const src = await img.getAttribute("src");
+        if (src) beforeSrcs.add(src);
+      }
+
+      // Upload via Add Media
+      const addBtn = page.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
+      await addBtn.click({ timeout: 5_000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      const fileInput = page.locator('input[type="file"]').first();
+      await fileInput.setInputFiles(tmpPath);
+      log(`  Uploaded ${label}, waiting for media.getMediaUrlRedirect src...`);
+
+      // Wait for new src
+      const deadline = Date.now() + 30_000;
+      let uploadedSrc = null;
+      while (!uploadedSrc && Date.now() < deadline) {
+        await page.waitForTimeout(1_000);
+        const allImgs = await page.locator('img[src*="media.getMediaUrlRedirect"]').all();
+        for (const img of allImgs) {
+          const src = await img.getAttribute("src");
+          if (src && !beforeSrcs.has(src)) { uploadedSrc = src; break; }
+        }
+      }
+      if (uploadedSrc) {
+        log(`  ${label} upload complete: ${uploadedSrc.slice(0, 80)}`);
+        await page.waitForTimeout(2_000);
+      } else {
+        log(`  ${label} upload timed out`);
+      }
+      return uploadedSrc;
+    };
+
+    const startSrc = VIDEO_START_URL ? await uploadAndWait(VIDEO_START_URL, "start frame") : null;
+    const endSrc   = VIDEO_END_URL   ? await uploadAndWait(VIDEO_END_URL,   "end frame")   : null;
+
+    // Wait for Start button
+    log(`  Waiting for 'Start' button...`);
+    await page.waitForSelector('div[type="button"]:has-text("Start")', { timeout: 10_000 });
+
+    // Click Start → select start image row (div.sc-1dc6bdcb-15)
+    if (startSrc) {
+      log(`  Clicking 'Start' button...`);
+      await page.locator('div[type="button"]:has-text("Start")').click({ timeout: 5_000 });
+      await page.waitForTimeout(1_000);
+      await page.waitForSelector('[data-testid="virtuoso-item-list"]', { timeout: 10_000 });
+
+      const nameId = startSrc.split("name=")[1];
+      log(`  Looking for row with img name=${nameId}`);
+      const row = page.locator(`[data-testid="virtuoso-item-list"] div[class*="sc-1dc6bdcb-15"]:has(img[src*="${nameId}"])`);
+      const rowCount = await row.count();
+      log(`  Found ${rowCount} matching row(s)`);
+      await row.click({ timeout: 5_000 });
+      await page.waitForTimeout(500);
+      log(`  Selected start frame`);
     }
 
-    if (VIDEO_END_URL && fileInputs.length >= 2) {
-      log(`  Downloading end frame: ${VIDEO_END_URL}`);
-      const res = await fetch(VIDEO_END_URL);
-      if (!res.ok) throw new Error(`Failed to download end frame: ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      const ext = VIDEO_END_URL.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
-      const tmpPath = path.join(os.tmpdir(), `video-end-${Date.now()}.${ext}`);
-      await writeFile(tmpPath, buf);
-      await fileInputs[1].setInputFiles(tmpPath);
-      log(`  Uploaded end frame: ${tmpPath}`);
-      await page.waitForTimeout(2_000);
+    // Click End → select end image row (div.sc-1dc6bdcb-15)
+    if (endSrc) {
+      log(`  Clicking 'End' button...`);
+      await page.locator('div[type="button"]:has-text("End")').click({ timeout: 5_000 });
+      await page.waitForTimeout(1_000);
+      await page.waitForSelector('[data-testid="virtuoso-item-list"]', { timeout: 10_000 });
+
+      const nameId = endSrc.split("name=")[1];
+      log(`  Looking for row with img name=${nameId}`);
+      const row = page.locator(`[data-testid="virtuoso-item-list"] div[class*="sc-1dc6bdcb-15"]:has(img[src*="${nameId}"])`);
+      const rowCount = await row.count();
+      log(`  Found ${rowCount} matching row(s)`);
+      await row.click({ timeout: 5_000 });
+      await page.waitForTimeout(500);
+      log(`  Selected end frame`);
     }
   });
 }
