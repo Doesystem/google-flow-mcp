@@ -16,6 +16,8 @@ export interface GenerateOptions {
 export interface GenerateVideoOptions {
   prompt: string;
   imagePaths?: string[];
+  videoStartPath?: string;
+  videoEndPath?: string;
   jobId: string;
 }
 
@@ -95,6 +97,10 @@ export class FlowDriver {
   async generateVideo(options: GenerateVideoOptions): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
+    // Always start fresh — navigate to Flow dashboard and create a new project
+    await this.resetToNewProject();
+
+    // Upload reference images if provided
     if (options.imagePaths && options.imagePaths.length > 0) {
       await this.uploadImages(options.imagePaths);
     }
@@ -106,6 +112,11 @@ export class FlowDriver {
     await this.setVideoCount();
     await this.selectVeoModel();
     await this.closeSettingsPanel();
+
+    // Upload video_start and video_end reference frames if provided
+    if (options.videoStartPath || options.videoEndPath) {
+      await this.uploadVideoFrames(options.videoStartPath, options.videoEndPath);
+    }
 
     const existingVideos = await this.page.locator(GENERATED_VIDEO_SELECTOR).all();
     const beforeSrcs = new Set<string>();
@@ -181,6 +192,51 @@ export class FlowDriver {
     }
     await this.clickCreate();
     return this.waitAndDownloadNewImages(1, existingSrcs, options.jobId);
+  }
+
+  private async resetToNewProject(): Promise<void> {
+    console.error("[google-flow-mcp] Navigating to Flow dashboard for new project...");
+    await this.page!.goto(FLOW_URL, { waitUntil: "networkidle" });
+
+    const onDashboard = await this.page!
+      .waitForSelector(DASHBOARD_SELECTOR, { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    if (onDashboard) {
+      await this.page!.locator(DASHBOARD_SELECTOR).click();
+      console.error("[google-flow-mcp] Created new Flow project");
+      await this.page!.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
+    } else {
+      await this.page!.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
+    }
+  }
+
+  private async uploadVideoFrames(startPath?: string, endPath?: string): Promise<void> {
+    // Flow video Frames mode has "First frame" and "Last frame" upload slots
+    // We look for file inputs in order: first = start frame, second = end frame
+    const fileInputs = await this.page!.locator('input[type="file"]').all();
+    console.error(`[google-flow-mcp] Found ${fileInputs.length} file input(s) for video frames`);
+
+    if (startPath && fileInputs.length >= 1) {
+      try {
+        await fileInputs[0].setInputFiles(startPath);
+        console.error(`[google-flow-mcp] Uploaded video start frame: ${startPath}`);
+        await this.page!.waitForTimeout(2_000);
+      } catch {
+        console.error("[google-flow-mcp] Could not upload video start frame");
+      }
+    }
+
+    if (endPath && fileInputs.length >= 2) {
+      try {
+        await fileInputs[1].setInputFiles(endPath);
+        console.error(`[google-flow-mcp] Uploaded video end frame: ${endPath}`);
+        await this.page!.waitForTimeout(2_000);
+      } catch {
+        console.error("[google-flow-mcp] Could not upload video end frame");
+      }
+    }
   }
 
   private async returnToCanvas(): Promise<void> {

@@ -269,18 +269,20 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
 
 /**
  * POST /video/generate
- * Body: { prompt, image_paths?, image_urls? }
+ * Body: { prompt, image_paths?, image_urls?, video_start?, video_end? }
+ * video_start / video_end: URL of image to use as first/last frame
  * Returns: { success, job_id, videos: [{ index, path, url }] }
  */
 async function handleGenerateVideo(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const body = await parseJson(req) as Record<string, unknown>;
-  const { prompt, image_paths, image_urls } = body;
+  const { prompt, image_paths, image_urls, video_start, video_end } = body;
 
   if (typeof prompt !== "string" || !prompt.trim()) {
     return sendError(res, 400, "prompt is required");
   }
 
   try {
+    // Download reference images
     const downloadedPaths: string[] = Array.isArray(image_urls)
       ? await Promise.all((image_urls as string[]).map(downloadToTemp))
       : [];
@@ -290,11 +292,21 @@ async function handleGenerateVideo(req: http.IncomingMessage, res: http.ServerRe
       ...downloadedPaths,
     ];
 
+    // Download video start/end frame images
+    const videoStartPath = typeof video_start === "string"
+      ? await downloadToTemp(video_start)
+      : undefined;
+    const videoEndPath = typeof video_end === "string"
+      ? await downloadToTemp(video_end)
+      : undefined;
+
     const jobId = generateJobId();
     const driver = await getDriver();
     const videos = await enqueue(() => driver.generateVideo({
       prompt,
       imagePaths: allPaths.length > 0 ? allPaths : undefined,
+      videoStartPath,
+      videoEndPath,
       jobId,
     }));
 

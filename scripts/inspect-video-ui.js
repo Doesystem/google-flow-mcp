@@ -16,6 +16,20 @@ const FLOW_URL = "https://labs.google/fx/tools/flow";
 const PROMPT_SELECTOR = '[data-slate-editor="true"]';
 const GENERATED_VIDEO_SELECTOR = 'video[src*="media.getMediaUrlRedirect"], video[src*="labs.google"]';
 const TEST_PROMPT = process.argv[2] || "a cat walking in a garden, cinematic";
+
+// Parse --start and --end flags
+// Usage: node scripts/inspect-video-ui.js "prompt" --start https://... --end https://...
+const args = process.argv.slice(3);
+let VIDEO_START_URL = null;
+let VIDEO_END_URL = null;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--start" && args[i + 1]) VIDEO_START_URL = args[++i];
+  if (args[i] === "--end"   && args[i + 1]) VIDEO_END_URL   = args[++i];
+}
+
+log(`Prompt: "${TEST_PROMPT}"`);
+if (VIDEO_START_URL) log(`Start frame: ${VIDEO_START_URL}`);
+if (VIDEO_END_URL)   log(`End frame:   ${VIDEO_END_URL}`);
 const OUT_DIR = path.join(os.homedir(), "GoogleFlow", "test-video");
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -153,7 +167,41 @@ await step("Close settings panel (Escape then click prompt editor)", async () =>
   await page.waitForTimeout(500);
 });
 
-// ── 10. Snapshot existing videos ─────────────────────────────────────────────
+// ── 10. Upload video start/end frames (if provided) ──────────────────────────
+if (VIDEO_START_URL || VIDEO_END_URL) {
+  await step("Upload video start/end frames", async () => {
+    const fileInputs = await page.locator('input[type="file"]').all();
+    log(`  Found ${fileInputs.length} file input(s)`);
+
+    if (VIDEO_START_URL && fileInputs.length >= 1) {
+      log(`  Downloading start frame: ${VIDEO_START_URL}`);
+      const res = await fetch(VIDEO_START_URL);
+      if (!res.ok) throw new Error(`Failed to download start frame: ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ext = VIDEO_START_URL.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
+      const tmpPath = path.join(os.tmpdir(), `video-start-${Date.now()}.${ext}`);
+      await writeFile(tmpPath, buf);
+      await fileInputs[0].setInputFiles(tmpPath);
+      log(`  Uploaded start frame: ${tmpPath}`);
+      await page.waitForTimeout(2_000);
+    }
+
+    if (VIDEO_END_URL && fileInputs.length >= 2) {
+      log(`  Downloading end frame: ${VIDEO_END_URL}`);
+      const res = await fetch(VIDEO_END_URL);
+      if (!res.ok) throw new Error(`Failed to download end frame: ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ext = VIDEO_END_URL.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "png";
+      const tmpPath = path.join(os.tmpdir(), `video-end-${Date.now()}.${ext}`);
+      await writeFile(tmpPath, buf);
+      await fileInputs[1].setInputFiles(tmpPath);
+      log(`  Uploaded end frame: ${tmpPath}`);
+      await page.waitForTimeout(2_000);
+    }
+  });
+}
+
+// ── 11. Snapshot existing videos ─────────────────────────────────────────────
 const existingVideos = await page.locator(GENERATED_VIDEO_SELECTOR).all();
 const beforeSrcs = new Set();
 for (const el of existingVideos) {
@@ -162,7 +210,7 @@ for (const el of existingVideos) {
 }
 log(`Snapshot: ${beforeSrcs.size} existing video(s) on page`);
 
-// ── 11. Type prompt ───────────────────────────────────────────────────────────
+// ── 12. Type prompt ───────────────────────────────────────────────────────────
 await step(`Type prompt: "${TEST_PROMPT}"`, async () => {
   const editor = page.locator(PROMPT_SELECTOR);
   await editor.click();
@@ -178,7 +226,7 @@ await step(`Type prompt: "${TEST_PROMPT}"`, async () => {
   log(`  Prompt field: "${typed?.slice(0, 80)}"`);
 });
 
-// ── 12. Click Create ──────────────────────────────────────────────────────────
+// ── 13. Click Create ──────────────────────────────────────────────────────────
 await step("Click Create", async () => {
   const editor = page.locator(PROMPT_SELECTOR);
   await editor.click({ timeout: 3_000 });
@@ -193,7 +241,7 @@ await step("Click Create", async () => {
   await page.waitForTimeout(2_000);
 });
 
-// ── 13. Poll for video ────────────────────────────────────────────────────────
+// ── 14. Poll for video ────────────────────────────────────────────────────────
 log("Polling for new video (max 5 min)...");
 const deadline = Date.now() + 300_000;
 let newSrcs = [];
@@ -217,7 +265,7 @@ if (newSrcs.length === 0) {
   process.exit(1);
 }
 
-// ── 14. Download video ────────────────────────────────────────────────────────
+// ── 15. Download video ────────────────────────────────────────────────────────
 await step("Download video", async () => {
   const url = newSrcs[0].startsWith("http") ? newSrcs[0] : `https://labs.google${newSrcs[0]}`;
   log(`  URL: ${url}`);
