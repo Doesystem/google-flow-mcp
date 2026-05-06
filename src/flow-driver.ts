@@ -4,20 +4,25 @@ const FLOW_URL = "https://labs.google/fx/tools/flow";
 const DASHBOARD_SELECTOR = 'button:has-text("New project")';
 const PROMPT_SELECTOR = '[data-slate-editor="true"]';
 const GENERATED_IMAGE_SELECTOR = 'img[src*="media.getMediaUrlRedirect"]';
+const GENERATED_VIDEO_SELECTOR = 'video[src*="media.getMediaUrlRedirect"], video[src*="labs.google"]';
 
 export interface GenerateOptions {
   prompt: string;
   imagePaths?: string[];
   aspectRatio?: string;
-  resolution?: string;
   count?: number;
+}
+
+export interface GenerateVideoOptions {
+  prompt: string;
+  imagePaths?: string[];
+  jobId: string;
 }
 
 export interface EditOptions {
   imagePaths: string[];
   prompt: string;
   aspectRatio?: string;
-  resolution?: string;
 }
 
 export interface RegenOptions {
@@ -44,20 +49,16 @@ export class FlowDriver {
     this.page = await this.context.newPage();
     await this.page.goto(FLOW_URL, { waitUntil: "networkidle" });
 
-    // Flow lands on project dashboard — reuse first existing project or create new
     const onDashboard = await this.page
       .waitForSelector(DASHBOARD_SELECTOR, { timeout: 10_000 })
       .then(() => true)
       .catch(() => false);
 
     if (onDashboard) {
-      // Always create a new project to start with a clean canvas
       await this.page.locator(DASHBOARD_SELECTOR).click();
       console.error("[google-flow-mcp] Created new Flow project");
-
       await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
     } else {
-      // May already be in a project
       await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 15_000 });
     }
   }
@@ -91,13 +92,39 @@ export class FlowDriver {
     return this.waitAndDownloadNewImages(count, beforeSrcs, options.jobId);
   }
 
+  async generateVideo(options: GenerateVideoOptions): Promise<GeneratedImage[]> {
+    if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
+
+    if (options.imagePaths && options.imagePaths.length > 0) {
+      await this.uploadImages(options.imagePaths);
+    }
+
+    await this.openSettingsPanel();
+    await this.selectVideoMode();
+    await this.selectVideoFrames();
+    await this.setVideoAspectRatio();
+    await this.setVideoCount();
+    await this.selectVeoModel();
+    await this.closeSettingsPanel();
+
+    const existingVideos = await this.page.locator(GENERATED_VIDEO_SELECTOR).all();
+    const beforeSrcs = new Set<string>();
+    for (const el of existingVideos) {
+      const src = await el.getAttribute("src");
+      if (src) beforeSrcs.add(src);
+    }
+
+    await this.typePrompt(options.prompt);
+    await this.clickCreate();
+
+    console.error(`[google-flow-mcp] Generating video "${options.prompt}" as ${options.jobId}`);
+    return this.waitAndDownloadNewVideos(beforeSrcs, options.jobId);
+  }
+
   async edit(options: EditOptions & { jobId: string }): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
-    // Navigate back to the main canvas before uploading
-    // in case we're still inside an edit view from a previous call
     await this.returnToCanvas();
-
     await this.uploadImages(options.imagePaths);
 
     await this.openSettingsPanel();
@@ -121,9 +148,8 @@ export class FlowDriver {
   async regen(options: RegenOptions & { jobId: string }): Promise<GeneratedImage[]> {
     if (!this.page) throw new Error("FlowDriver not initialized. Call init() first.");
 
-    // Click on the nth generated image to open the edit view
     const allImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
-    const targetIndex = options.imageIndex - 1; // 1-based to 0-based
+    const targetIndex = options.imageIndex - 1;
 
     if (targetIndex < 0 || targetIndex >= allImages.length) {
       throw new Error(
@@ -134,7 +160,6 @@ export class FlowDriver {
     await allImages[targetIndex].click();
     console.error(`[google-flow-mcp] Clicked generated image #${options.imageIndex} to open edit view`);
 
-    // Wait for the edit view prompt to appear
     await this.page.waitForSelector(PROMPT_SELECTOR, { timeout: 10_000 });
     await this.page.waitForTimeout(1_000);
 
@@ -144,7 +169,6 @@ export class FlowDriver {
       await this.closeSettingsPanel();
     }
 
-    // Snapshot existing images before creating
     const existingImages = await this.page.locator(GENERATED_IMAGE_SELECTOR).all();
     const existingSrcs = new Set<string>();
     for (const el of existingImages) {
@@ -161,8 +185,6 @@ export class FlowDriver {
 
   private async returnToCanvas(): Promise<void> {
     const currentUrl = this.page!.url();
-    // Edit view URL pattern: /project/{id}/edit/{editId}
-    // Canvas URL pattern:    /project/{id}
     if (!currentUrl.includes("/edit/")) return;
 
     const canvasUrl = currentUrl.replace(/\/edit\/[^/]+$/, "");
@@ -174,7 +196,6 @@ export class FlowDriver {
   }
 
   private async openSettingsPanel(): Promise<void> {
-    // Dump all visible buttons to help identify the correct selector
     const allButtons = await this.page!.locator("button").all();
     const buttonTexts: string[] = [];
     for (const btn of allButtons) {
@@ -183,7 +204,6 @@ export class FlowDriver {
     }
     console.error(`[google-flow-mcp] Visible buttons on page: ${buttonTexts.join(", ")}`);
 
-    // Click the model chip (e.g. "Nano Banana 2") to open settings
     const modelChip = this.page!.locator('button:has-text("Nano Banana")');
     const chipCount = await modelChip.count();
     console.error(`[google-flow-mcp] Found ${chipCount} button(s) matching "Nano Banana"`);
@@ -194,38 +214,34 @@ export class FlowDriver {
     } catch {
       console.error("[google-flow-mcp] Could not open settings panel — dumping page HTML snippet");
       const html = await this.page!.content();
-      // Print first 3000 chars to avoid flooding logs
       console.error("[google-flow-mcp] PAGE HTML (first 3000 chars):\n" + html.slice(0, 3000));
     }
   }
 
   private async closeSettingsPanel(): Promise<void> {
-    // Click the prompt editor to dismiss the popover and restore focus there
+    // Press Escape first to close any open Radix popper/dropdown
+    await this.page!.keyboard.press("Escape");
+    await this.page!.waitForTimeout(500);
+    // Then click the prompt editor to restore focus
     const editor = this.page!.locator(PROMPT_SELECTOR);
     try {
-      await editor.click({ timeout: 3_000 });
+      await editor.click({ timeout: 5_000 });
     } catch {
-      // Fallback to Escape
-      await this.page!.keyboard.press("Escape");
+      // ignore — editor may not be visible in all contexts
     }
-    await this.page!.waitForTimeout(500);
+    await this.page!.waitForTimeout(300);
   }
 
   private async typePrompt(prompt: string): Promise<void> {
     const editor = this.page!.locator(PROMPT_SELECTOR);
 
-    // Click to focus
     await editor.click();
     await this.page!.waitForTimeout(500);
-
-    // Select all and delete existing content
     await this.page!.keyboard.press("Control+a");
     await this.page!.waitForTimeout(200);
     await this.page!.keyboard.press("Backspace");
     await this.page!.waitForTimeout(300);
 
-    // Write to clipboard via browser API then paste with Ctrl+V
-    // This is the most reliable way to insert text into Slate in headless mode
     await this.page!.evaluate((text) => navigator.clipboard.writeText(text), prompt);
     await this.page!.keyboard.press("Control+v");
     await this.page!.waitForTimeout(500);
@@ -240,8 +256,6 @@ export class FlowDriver {
       console.error(`[google-flow-mcp] Unknown aspect ratio: ${ratio}, skipping`);
       return;
     }
-
-    // Aspect ratio buttons are inside the settings panel with text like "16:9", "4:3", etc.
     const ratioButton = this.page!.locator(`button:has-text("${ratio}")`).first();
     try {
       await ratioButton.click({ timeout: 5_000 });
@@ -256,7 +270,6 @@ export class FlowDriver {
       return;
     }
 
-    // Dump all tabs/buttons visible after settings panel opens
     const allTabs = await this.page!.locator("[role='tab']").all();
     const tabTexts: string[] = [];
     for (const tab of allTabs) {
@@ -265,7 +278,6 @@ export class FlowDriver {
     }
     console.error(`[google-flow-mcp] Visible [role=tab] elements: ${tabTexts.join(", ") || "(none)"}`);
 
-    // Flow uses "1x" for count=1, "x2"/"x3"/"x4" for count=2-4
     const label = count === 1 ? "1x" : `x${count}`;
     const countButton = this.page!.locator(`button[role="tab"]:text-is("${label}")`);
     const btnCount = await countButton.count();
@@ -279,7 +291,6 @@ export class FlowDriver {
   }
 
   private async clickCreate(): Promise<void> {
-    // Re-focus the prompt editor first to ensure the form is active
     const editor = this.page!.locator(PROMPT_SELECTOR);
     try {
       await editor.click({ timeout: 3_000 });
@@ -288,12 +299,10 @@ export class FlowDriver {
       console.error("[google-flow-mcp] Could not re-focus prompt editor before Create");
     }
 
-    // Try submitting via Enter key first (works better with Slate editors)
     console.error("[google-flow-mcp] Submitting via Enter key");
     await this.page!.keyboard.press("Enter");
     await this.page!.waitForTimeout(1_000);
 
-    // Check if a loading/generating state appeared — if not, fall back to button click
     const createBtn = this.page!.locator('button:has-text("Create")').last();
     const btnCount = await createBtn.count();
     console.error(`[google-flow-mcp] Found ${btnCount} button(s) matching "Create"`);
@@ -311,7 +320,6 @@ export class FlowDriver {
     existingSrcs: Set<string>,
     jobId: string
   ): Promise<GeneratedImage[]> {
-    // Poll for new images that weren't on the page before generation
     const deadline = Date.now() + 120_000;
     let newSrcs: string[] = [];
 
@@ -327,7 +335,6 @@ export class FlowDriver {
       }
       console.error(`[google-flow-mcp]   Polling: found ${newSrcs.length}/${expectedCount} new image(s) (total imgs on page: ${allElements.length})`);
 
-      // On first poll, dump all img srcs to help diagnose selector issues
       if (newSrcs.length === 0 && allElements.length === 0) {
         const allImgs = await this.page!.locator("img").all();
         const srcs: string[] = [];
@@ -363,8 +370,46 @@ export class FlowDriver {
     return images;
   }
 
+  private async waitAndDownloadNewVideos(
+    existingSrcs: Set<string>,
+    jobId: string
+  ): Promise<GeneratedImage[]> {
+    const deadline = Date.now() + 300_000; // 5 min — video takes longer
+    let newSrcs: string[] = [];
+
+    while (newSrcs.length < 1 && Date.now() < deadline) {
+      await this.page!.waitForTimeout(5_000);
+      const allElements = await this.page!.locator(GENERATED_VIDEO_SELECTOR).all();
+      newSrcs = [];
+      for (const el of allElements) {
+        const src = await el.getAttribute("src");
+        if (src && !existingSrcs.has(src)) {
+          newSrcs.push(src);
+        }
+      }
+      console.error(`[google-flow-mcp]   Polling video: found ${newSrcs.length}/1 new video(s) (total on page: ${allElements.length})`);
+    }
+
+    console.error(`[google-flow-mcp] Found ${newSrcs.length} new video(s)`);
+
+    const images: GeneratedImage[] = [];
+    for (let i = 0; i < newSrcs.length; i++) {
+      try {
+        const url = newSrcs[i].startsWith("http") ? newSrcs[i] : `https://labs.google${newSrcs[i]}`;
+        console.error(`[google-flow-mcp] Downloading video ${i + 1}: ${url}`);
+        const response = await this.page!.request.get(url);
+        console.error(`[google-flow-mcp] Download status: ${response.status()}`);
+        const buffer = Buffer.from(await response.body());
+        images.push({ buffer, index: i + 1, jobId });
+      } catch (err) {
+        console.error(`[google-flow-mcp] Failed to download video ${i + 1}:`, err);
+      }
+    }
+
+    return images;
+  }
+
   private async uploadImages(imagePaths: string[]): Promise<void> {
-    // Snapshot existing media srcs before upload
     const beforeImgs = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
     const beforeSrcs = new Set<string>();
     for (const img of beforeImgs) {
@@ -372,13 +417,12 @@ export class FlowDriver {
       if (src) beforeSrcs.add(src);
     }
 
-    // Click the "Add Media" button to reveal the file input
     const addBtn = this.page!.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
     try {
       await addBtn.click({ timeout: 5_000 });
       await this.page!.waitForTimeout(500);
     } catch {
-      // fall through to try file input directly
+      // fall through
     }
 
     const fileInput = this.page!.locator('input[type="file"]').first();
@@ -390,8 +434,6 @@ export class FlowDriver {
       return;
     }
 
-    // Wait for the uploaded image to appear — it uses the same media.getMediaUrlRedirect URL
-    // as generated images, so we wait for a NEW src that wasn't there before upload
     console.error("[google-flow-mcp] Waiting for upload to complete...");
     let uploadedSrc: string | null = null;
     const deadline = Date.now() + 30_000;
@@ -421,6 +463,71 @@ export class FlowDriver {
       }
     } else {
       console.error("[google-flow-mcp] Upload timed out — proceeding anyway");
+    }
+  }
+
+  private async selectVideoMode(): Promise<void> {
+    const videoTab = this.page!.locator('[role="tab"][id*="trigger-VIDEO"]:not([id*="VIDEO_FRAMES"]):not([id*="VIDEO_REFERENCES"])');
+    try {
+      await videoTab.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(800);
+      console.error("[google-flow-mcp] Selected Video mode");
+    } catch {
+      console.error("[google-flow-mcp] Could not select Video mode");
+    }
+  }
+
+  private async selectVideoFrames(): Promise<void> {
+    const framesTab = this.page!.locator('[role="tab"][id*="VIDEO_FRAMES"]');
+    try {
+      await framesTab.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
+      console.error("[google-flow-mcp] Selected Frames output type");
+    } catch {
+      console.error("[google-flow-mcp] Could not select Frames output type");
+    }
+  }
+
+  private async setVideoAspectRatio(): Promise<void> {
+    const portraitTab = this.page!.locator('[role="tab"][id*="PORTRAIT"]:has-text("9:16")');
+    try {
+      await portraitTab.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
+      console.error("[google-flow-mcp] Selected 9:16 aspect ratio");
+    } catch {
+      console.error("[google-flow-mcp] Could not select 9:16 aspect ratio");
+    }
+  }
+
+  private async setVideoCount(): Promise<void> {
+    const countTab = this.page!.locator('[role="tab"]:text-is("1x")');
+    try {
+      await countTab.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
+      console.error("[google-flow-mcp] Selected 1x count");
+    } catch {
+      console.error("[google-flow-mcp] Could not select 1x count");
+    }
+  }
+
+  private async selectVeoModel(): Promise<void> {
+    const veoChip = this.page!.locator('button[aria-haspopup="menu"]:has-text("Veo")');
+    try {
+      await veoChip.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(800);
+      console.error("[google-flow-mcp] Opened Veo model menu");
+    } catch {
+      console.error("[google-flow-mcp] Could not open Veo model menu");
+      return;
+    }
+
+    const veoFast = this.page!.locator('[role="menuitem"]:has-text("Veo 3.1 - Fast"), [role="option"]:has-text("Veo 3.1 - Fast")');
+    try {
+      await veoFast.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
+      console.error("[google-flow-mcp] Selected Veo 3.1 - Fast");
+    } catch {
+      console.error("[google-flow-mcp] Could not select Veo 3.1 - Fast — using current model");
     }
   }
 

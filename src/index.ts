@@ -16,6 +16,11 @@ import {
   getLastJobRecord,
 } from "./file-manager.js";
 
+// Video files use .mp4 extension
+function buildJobVideoPath(jobId: string, index: number): string {
+  return buildJobImagePath(jobId, index).replace(/\.png$/, ".mp4");
+}
+
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
 const authManager = new AuthManager();
@@ -262,10 +267,59 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
   }
 }
 
+/**
+ * POST /video/generate
+ * Body: { prompt, image_paths?, image_urls? }
+ * Returns: { success, job_id, videos: [{ index, path, url }] }
+ */
+async function handleGenerateVideo(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const body = await parseJson(req) as Record<string, unknown>;
+  const { prompt, image_paths, image_urls } = body;
+
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return sendError(res, 400, "prompt is required");
+  }
+
+  try {
+    const downloadedPaths: string[] = Array.isArray(image_urls)
+      ? await Promise.all((image_urls as string[]).map(downloadToTemp))
+      : [];
+
+    const allPaths = [
+      ...(Array.isArray(image_paths) ? (image_paths as string[]) : []),
+      ...downloadedPaths,
+    ];
+
+    const jobId = generateJobId();
+    const driver = await getDriver();
+    const videos = await enqueue(() => driver.generateVideo({
+      prompt,
+      imagePaths: allPaths.length > 0 ? allPaths : undefined,
+      jobId,
+    }));
+
+    const saved: { index: number; path: string; url: string }[] = [];
+    for (const video of videos) {
+      const filePath = buildJobVideoPath(jobId, video.index);
+      await saveImage(video.buffer, filePath);
+      saved.push({ index: video.index, path: filePath, url: `/video/collect/${jobId}/${video.index}` });
+    }
+
+    await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    send(res, 200, { success: true, job_id: jobId, videos: saved });
+  } catch (error) {
+    activeDriver = null;
+    sendError(res, 500, error instanceof Error ? error.message : String(error));
+  }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 // Match GET /img/collect/{jobId}/{index}
 const IMG_ROUTE = /^\/img\/collect\/(job-[\w-]+)\/(\d+)$/;
+
+// Match GET /video/collect/{jobId}/{index}
+const VIDEO_ROUTE = /^\/video\/collect\/(job-[\w-]+)\/(\d+)$/;
 
 async function router(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const method = req.method ?? "";
@@ -278,9 +332,9 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   // Image serving — GET /img/collect/{jobId}/{index}
   if (method === "GET") {
-    const match = IMG_ROUTE.exec(url);
-    if (match) {
-      const [, jobId, indexStr] = match;
+    const imgMatch = IMG_ROUTE.exec(url);
+    if (imgMatch) {
+      const [, jobId, indexStr] = imgMatch;
       const filePath = buildJobImagePath(jobId, parseInt(indexStr, 10));
       try {
         const buffer = await readFile(filePath);
@@ -295,6 +349,25 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       return;
     }
+
+    const videoMatch = VIDEO_ROUTE.exec(url);
+    if (videoMatch) {
+      const [, jobId, indexStr] = videoMatch;
+      const filePath = buildJobVideoPath(jobId, parseInt(indexStr, 10));
+      try {
+        const buffer = await readFile(filePath);
+        res.writeHead(200, {
+          "Content-Type": "video/mp4",
+          "Content-Length": buffer.length,
+          "Cache-Control": "public, max-age=31536000, immutable",
+        });
+        res.end(buffer);
+      } catch {
+        sendError(res, 404, `Video not found: ${jobId}/${indexStr}`);
+      }
+      return;
+    }
+
     return sendError(res, 404, `Not found: ${url}`);
   }
 
@@ -307,6 +380,7 @@ async function router(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (url === "/collect")      return await handleCollect(req, res);
     if (url === "/img/edit")     return await handleEdit(req, res);
     if (url === "/img/regen")    return await handleRegen(req, res);
+    if (url === "/video/generate") return await handleGenerateVideo(req, res);
 
     sendError(res, 404, `Unknown endpoint: ${url}`);
   } catch (error) {
@@ -337,7 +411,9 @@ async function main(): Promise<void> {
     console.log(`[google-flow-mcp] Endpoints:`);
     console.log(`  GET  /health`);
     console.log(`  GET  /img/collect/{jobId}/{index}  (serve image)`);
+    console.log(`  GET  /video/collect/{jobId}/{index}  (serve video)`);
     console.log(`  POST /img/generate`);
+    console.log(`  POST /video/generate`);
     console.log(`  POST /collect`);
     console.log(`  POST /img/edit`);
     console.log(`  POST /img/regen`);
