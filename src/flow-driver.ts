@@ -408,7 +408,9 @@ export class FlowDriver {
     }
 
     if (uploadedSrc) {
-      console.error("[google-flow-mcp] Upload complete, clicking uploaded image to activate edit mode...");
+      console.error("[google-flow-mcp] Upload complete, waiting 5s for image to render...");
+      await this.page!.waitForTimeout(5_000);
+      console.error("[google-flow-mcp] Clicking uploaded image to activate edit mode...");
       const uploadedImg = this.page!.locator(`img[src="${uploadedSrc}"]`).first();
       try {
         await uploadedImg.click({ timeout: 5_000 });
