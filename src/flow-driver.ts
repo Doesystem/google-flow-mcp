@@ -346,20 +346,55 @@ export class FlowDriver {
   }
 
   private async uploadImages(imagePaths: string[]): Promise<void> {
-    // Click the "+" / "Add Media" button to get file input
+    // Click the "Add Media" button to reveal the file input
     const addBtn = this.page!.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
     try {
       await addBtn.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
     } catch {
       // fall through to try file input directly
     }
 
     const fileInput = this.page!.locator('input[type="file"]').first();
     try {
-      // Playwright setInputFiles accepts an array for multi-file upload
       await fileInput.setInputFiles(imagePaths);
+      console.error(`[google-flow-mcp] Uploading ${imagePaths.length} image(s)...`);
     } catch {
       console.error("[google-flow-mcp] Could not upload images");
+      return;
+    }
+
+    // Wait for upload to complete — Flow shows a thumbnail/preview once upload is done.
+    // We wait for an <img> with a blob: or data: src, or for the file input to clear,
+    // with a generous timeout of 30s.
+    console.error("[google-flow-mcp] Waiting for upload to complete...");
+    try {
+      await this.page!.waitForFunction(
+        () => {
+          // Look for uploaded image previews (blob URLs or base64)
+          const imgs = Array.from(document.querySelectorAll("img"));
+          return imgs.some(
+            (img) => img.src.startsWith("blob:") || img.src.startsWith("data:")
+          );
+        },
+        { timeout: 30_000 }
+      );
+      console.error("[google-flow-mcp] Upload complete (preview detected)");
+    } catch {
+      // Preview detection failed — wait a fixed time as fallback
+      console.error("[google-flow-mcp] Upload preview not detected, waiting 5s as fallback...");
+      await this.page!.waitForTimeout(5_000);
+    }
+
+    // After upload, Flow requires clicking on the uploaded image thumbnail
+    // to activate the prompt editor for editing
+    console.error("[google-flow-mcp] Clicking uploaded image to activate edit mode...");
+    try {
+      const uploadedThumb = this.page!.locator("img[src^='blob:'], img[src^='data:']").first();
+      await uploadedThumb.click({ timeout: 5_000 });
+      await this.page!.waitForTimeout(500);
+    } catch {
+      console.error("[google-flow-mcp] Could not click uploaded image thumbnail");
     }
   }
 
