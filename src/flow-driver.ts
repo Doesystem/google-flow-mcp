@@ -346,6 +346,14 @@ export class FlowDriver {
   }
 
   private async uploadImages(imagePaths: string[]): Promise<void> {
+    // Snapshot existing media srcs before upload
+    const beforeImgs = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+    const beforeSrcs = new Set<string>();
+    for (const img of beforeImgs) {
+      const src = await img.getAttribute("src");
+      if (src) beforeSrcs.add(src);
+    }
+
     // Click the "Add Media" button to reveal the file input
     const addBtn = this.page!.locator('button:has-text("Add Media"), button:has-text("add_2Create")').first();
     try {
@@ -364,37 +372,35 @@ export class FlowDriver {
       return;
     }
 
-    // Wait for upload to complete — Flow shows a thumbnail/preview once upload is done.
-    // We wait for an <img> with a blob: or data: src, or for the file input to clear,
-    // with a generous timeout of 30s.
+    // Wait for the uploaded image to appear — it uses the same media.getMediaUrlRedirect URL
+    // as generated images, so we wait for a NEW src that wasn't there before upload
     console.error("[google-flow-mcp] Waiting for upload to complete...");
-    try {
-      await this.page!.waitForFunction(
-        () => {
-          // Look for uploaded image previews (blob URLs or base64)
-          const imgs = Array.from(document.querySelectorAll("img"));
-          return imgs.some(
-            (img) => img.src.startsWith("blob:") || img.src.startsWith("data:")
-          );
-        },
-        { timeout: 30_000 }
-      );
-      console.error("[google-flow-mcp] Upload complete (preview detected)");
-    } catch {
-      // Preview detection failed — wait a fixed time as fallback
-      console.error("[google-flow-mcp] Upload preview not detected, waiting 5s as fallback...");
-      await this.page!.waitForTimeout(5_000);
+    let uploadedSrc: string | null = null;
+    const deadline = Date.now() + 30_000;
+    while (!uploadedSrc && Date.now() < deadline) {
+      await this.page!.waitForTimeout(1_000);
+      const allImgs = await this.page!.locator(GENERATED_IMAGE_SELECTOR).all();
+      for (const img of allImgs) {
+        const src = await img.getAttribute("src");
+        if (src && !beforeSrcs.has(src)) {
+          uploadedSrc = src;
+          break;
+        }
+      }
     }
 
-    // After upload, Flow requires clicking on the uploaded image thumbnail
-    // to activate the prompt editor for editing
-    console.error("[google-flow-mcp] Clicking uploaded image to activate edit mode...");
-    try {
-      const uploadedThumb = this.page!.locator("img[src^='blob:'], img[src^='data:']").first();
-      await uploadedThumb.click({ timeout: 5_000 });
-      await this.page!.waitForTimeout(500);
-    } catch {
-      console.error("[google-flow-mcp] Could not click uploaded image thumbnail");
+    if (uploadedSrc) {
+      console.error("[google-flow-mcp] Upload complete, clicking uploaded image to activate edit mode...");
+      const uploadedImg = this.page!.locator(`img[src="${uploadedSrc}"]`).first();
+      try {
+        await uploadedImg.click({ timeout: 5_000 });
+        await this.page!.waitForTimeout(500);
+        console.error("[google-flow-mcp] Clicked uploaded image");
+      } catch {
+        console.error("[google-flow-mcp] Could not click uploaded image");
+      }
+    } else {
+      console.error("[google-flow-mcp] Upload timed out — proceeding anyway");
     }
   }
 
