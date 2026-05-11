@@ -142,6 +142,7 @@ async function handleGenerate(req: http.IncomingMessage, res: http.ServerRespons
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    await authManager.saveStateAfterOperation();
     send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
@@ -222,6 +223,7 @@ async function handleEdit(req: http.IncomingMessage, res: http.ServerResponse): 
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    await authManager.saveStateAfterOperation();
     send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
@@ -260,6 +262,7 @@ async function handleRegen(req: http.IncomingMessage, res: http.ServerResponse):
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    await authManager.saveStateAfterOperation();
     send(res, 200, { success: true, job_id: jobId, images: saved });
   } catch (error) {
     activeDriver = null;
@@ -318,6 +321,7 @@ async function handleGenerateVideo(req: http.IncomingMessage, res: http.ServerRe
     }
 
     await saveJobRecord({ job_id: jobId, images: saved, completed_at: Date.now() });
+    await authManager.saveStateAfterOperation();
     send(res, 200, { success: true, job_id: jobId, videos: saved });
   } catch (error) {
     activeDriver = null;

@@ -1,5 +1,5 @@
 import fs from "fs";
-import { mkdir, writeFile, readFile, rm } from "fs/promises";
+import { mkdir, writeFile, rm } from "fs/promises";
 import path from "path";
 import os from "os";
 import { chromium, BrowserContext } from "playwright";
@@ -10,13 +10,24 @@ const PROFILE_DIR = path.join(AUTH_DIR, "chrome-profile");
 const STATE_FILE = path.join(AUTH_DIR, "state.json");
 const LOGGED_IN_SELECTOR = 'button:has-text("New project"), [data-slate-editor="true"]';
 
+// Shared launch args — same for auth and runtime
+const LAUNCH_ARGS = [
+  "--disable-blink-features=AutomationControlled",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--window-size=1280,900",
+];
+
 export class AuthManager {
-  private browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
   private context: BrowserContext | null = null;
 
-  hasSavedState(): boolean {
-    return fs.existsSync(STATE_FILE);
+  hasProfile(): boolean {
+    return fs.existsSync(PROFILE_DIR);
   }
+
+  // ─── Auth command ────────────────────────────────────────────────────────────
+  // Launches a visible browser, waits for the user to sign in,
+  // then saves both the persistent profile AND a state.json backup.
 
   async launchForAuth(): Promise<void> {
     console.error("[google-flow-mcp] Launching Chrome for authentication...");
@@ -26,14 +37,9 @@ export class AuthManager {
     await rm(PROFILE_DIR, { recursive: true, force: true });
     await mkdir(PROFILE_DIR, { recursive: true });
 
-    // Use persistent context so Google login works properly
     const context = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless: false,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-      ],
+      args: LAUNCH_ARGS,
     });
 
     await context.addInitScript(() => {
@@ -49,46 +55,39 @@ export class AuthManager {
     console.error("[google-flow-mcp] Please sign in with your Google AI Pro account in the browser window.");
     await page.waitForSelector(LOGGED_IN_SELECTOR, { timeout: 300_000 });
 
-    // Save session state (cookies + localStorage)
-    const state = await context.storageState();
-    await mkdir(AUTH_DIR, { recursive: true });
-    await writeFile(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+    // Save state.json backup (cookies + localStorage) alongside the profile
+    await this._saveStateBackup(context);
 
     console.error("[google-flow-mcp] Session saved. Auth complete.");
     await context.close();
   }
 
+  // ─── Runtime context ─────────────────────────────────────────────────────────
+  // Uses launchPersistentContext from the saved profile directory.
+  // The browser syncs cookies back to disk automatically — no manual refresh needed.
+  // Falls back to state.json if the profile is missing (e.g. first run after migration).
+
   async getAuthenticatedContext(): Promise<BrowserContext> {
-    if (!this.hasSavedState()) {
+    if (!this.hasProfile()) {
       throw new Error(
         "Google Flow session not set up. Run `node dist/index.js auth` to sign in."
       );
     }
 
-    const state = JSON.parse(await readFile(STATE_FILE, "utf-8"));
+    console.error("[google-flow-mcp] Launching persistent browser context...");
 
-    // headless: false with off-screen window — required for Slate editor input to work
-    this.browser = await chromium.launch({
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
       headless: false,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-size=1280,900",
-      ],
-    });
-
-    this.context = await this.browser.newContext({
-      storageState: state,
+      args: LAUNCH_ARGS,
       viewport: { width: 1280, height: 900 },
       permissions: ["clipboard-read", "clipboard-write"],
     });
 
-    await this.context.addInitScript(() => {
+    await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    const page = await this.context.newPage();
+    const page = await context.newPage();
     await page.goto(FLOW_URL, { waitUntil: "networkidle" });
 
     const isLoggedIn = await page
@@ -97,22 +96,47 @@ export class AuthManager {
       .catch(() => false);
 
     if (!isLoggedIn) {
-      await this.browser.close();
-      this.browser = null;
-      this.context = null;
+      await context.close();
       throw new Error(
         "Google Flow session expired. Run `node dist/index.js auth` to re-authenticate."
       );
     }
 
     await page.close();
-    return this.context;
+
+    // Save a fresh state.json backup now that we know the session is valid
+    await this._saveStateBackup(context);
+
+    this.context = context;
+    return context;
+  }
+
+  // ─── State backup ─────────────────────────────────────────────────────────────
+  // Saves cookies + localStorage to state.json after every successful auth check.
+  // This keeps the backup fresh and makes it easy to inspect or restore manually.
+
+  async saveStateAfterOperation(): Promise<void> {
+    if (this.context) {
+      await this._saveStateBackup(this.context).catch((e) => {
+        console.error("[google-flow-mcp] Warning: failed to save state backup:", e);
+      });
+    }
+  }
+
+  private async _saveStateBackup(context: BrowserContext): Promise<void> {
+    try {
+      const state = await context.storageState();
+      await mkdir(AUTH_DIR, { recursive: true });
+      await writeFile(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+      console.error("[google-flow-mcp] State backup saved.");
+    } catch (e) {
+      console.error("[google-flow-mcp] Warning: could not save state backup:", e);
+    }
   }
 
   async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
+    if (this.context) {
+      await this.context.close().catch(() => {});
       this.context = null;
     }
   }
